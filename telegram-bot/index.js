@@ -58,6 +58,7 @@ const HELP_TEXT_BASE = [
   "• Выбор даты через календарь",
   "• Выбор времени удобными слотами",
   "• Заявки проходят согласование админа",
+  "• Мастер бронирования обновляет одно сообщение (чат не забивается кнопками).",
   "",
   "Команды:",
   "/start — главное меню",
@@ -92,67 +93,86 @@ bot.onText(/^\/admin$/, (msg) => {
   sendAdminMenu(msg.chat.id);
 });
 
-bot.on("message", (msg) => {
+bot.on("message", async (msg) => {
   if (!msg.text || msg.text.startsWith("/")) return;
+  const chatId = msg.chat.id;
   const state = activeStates.get(msg.from.id);
   if (!state) {
-    sendMainMenu(msg.chat.id, msg.from.id, "Используйте меню кнопок:");
+    sendMainMenu(chatId, msg.from.id, "Используйте меню кнопок:");
     return;
   }
 
   if (!["full_name", "phone", "purpose"].includes(state.step)) {
-    bot.sendMessage(msg.chat.id, "Используйте кнопки для выбора даты, времени и длительности.");
+    bot.sendMessage(chatId, "Используйте кнопки для выбора даты, времени и длительности.");
     return;
   }
+
+  await bot.deleteMessage(chatId, msg.message_id).catch(() => {});
 
   if (state.step === "full_name") {
     const fullName = msg.text.trim();
     if (fullName.length < 5) {
-      bot.sendMessage(msg.chat.id, "Введите ФИО полностью (минимум 5 символов).");
+      await updateBookingFlowPanel(
+        state,
+        chatId,
+        "⚠️ ФИО слишком короткое (минимум 5 символов).\n\n5/8 Введите ваше ФИО одним сообщением:",
+        bookingTextControls()
+      );
       return;
     }
     state.data.fullName = fullName;
     state.step = "phone";
-    bot.sendMessage(msg.chat.id, "6/7 Введите номер телефона для связи (например: +79991234567):", {
-      reply_markup: bookingTextControls(),
-    });
+    await updateBookingFlowPanel(
+      state,
+      chatId,
+      "6/7 Введите номер телефона для связи (например: +79991234567):",
+      bookingTextControls()
+    );
     return;
   }
 
   if (state.step === "phone") {
     const phone = msg.text.trim();
     if (!isValidPhone(phone)) {
-      bot.sendMessage(msg.chat.id, "Некорректный номер. Пример: +79991234567");
+      await updateBookingFlowPanel(
+        state,
+        chatId,
+        "⚠️ Некорректный номер. Пример: +79991234567\n\n6/7 Введите номер телефона:",
+        bookingTextControls()
+      );
       return;
     }
     state.data.phone = phone;
     state.step = "purpose";
-    bot.sendMessage(msg.chat.id, "7/7 Напишите цель бронирования:", {
-      reply_markup: bookingTextControls(),
-    });
+    await updateBookingFlowPanel(state, chatId, "7/7 Напишите цель бронирования одним сообщением:", bookingTextControls());
     return;
   }
 
   const purpose = msg.text.trim();
   if (!purpose) {
-    bot.sendMessage(msg.chat.id, "Цель не может быть пустой.");
+    await updateBookingFlowPanel(
+      state,
+      chatId,
+      "⚠️ Цель не может быть пустой.\n\n7/7 Напишите цель бронирования:",
+      bookingTextControls()
+    );
     return;
   }
   state.data.purpose = purpose;
 
   state.step = "confirm";
-  bot.sendMessage(msg.chat.id, buildBookingPreview(state.data), {
-    reply_markup: confirmInlineKeyboard(),
-  });
+  await updateBookingFlowPanel(state, chatId, buildBookingPreview(state.data), confirmInlineKeyboard());
 });
 
-bot.on("callback_query", (query) => {
+bot.on("callback_query", async (query) => {
   const data = query.data || "";
   const msg = query.message;
   const chatId = msg ? msg.chat.id : query.from.id;
   const userId = query.from.id;
 
   if (data === "menu") {
+    const st = activeStates.get(userId);
+    if (st) await deleteBookingFlowMessage(st);
     activeStates.delete(userId);
     sendMainMenu(chatId, userId, "🏠 Главное меню");
     return answer(query.id);
@@ -182,14 +202,20 @@ bot.on("callback_query", (query) => {
   }
 
   if (data === "book_start") {
+    const prev = activeStates.get(userId);
+    if (prev) await deleteBookingFlowMessage(prev);
     activeStates.set(userId, {
       step: "pick_room",
       data: { userId, username: query.from.username || query.from.first_name || "unknown" },
+      flowMessageId: null,
+      flowChatId: null,
     });
-    bot.sendMessage(
+    const state = activeStates.get(userId);
+    await updateBookingFlowPanel(
+      state,
       chatId,
       "1/5 Выберите помещение (на кнопках — макс. число гостей 👥):",
-      { reply_markup: roomInlineKeyboard() }
+      roomInlineKeyboard()
     );
     return answer(query.id);
   }
@@ -199,39 +225,53 @@ bot.on("callback_query", (query) => {
     if (!state) return answer(query.id, "Нет активного бронирования.");
     if (state.step === "phone") {
       state.step = "full_name";
-      bot.sendMessage(chatId, "5/8 Введите ваше ФИО:", { reply_markup: bookingTextControls() });
+      await updateBookingFlowPanel(state, chatId, "5/8 Введите ваше ФИО одним сообщением:", bookingTextControls());
       return answer(query.id);
     }
     if (state.step === "purpose") {
       state.step = "phone";
-      bot.sendMessage(chatId, "6/7 Введите номер телефона:", { reply_markup: bookingTextControls() });
+      await updateBookingFlowPanel(
+        state,
+        chatId,
+        "6/7 Введите номер телефона для связи (например: +79991234567):",
+        bookingTextControls()
+      );
       return answer(query.id);
     }
     if (state.step === "confirm") {
       state.step = "purpose";
-      bot.sendMessage(chatId, "7/7 Напишите цель бронирования:", { reply_markup: bookingTextControls() });
+      await updateBookingFlowPanel(state, chatId, "7/7 Напишите цель бронирования одним сообщением:", bookingTextControls());
       return answer(query.id);
     }
     if (state.step === "pick_duration") {
       state.step = "pick_time";
-      bot.sendMessage(chatId, `3/5 Время для ${state.data.date} (${formatRoomForDisplay(state.data.room)}):`, {
-        reply_markup: timeInlineKeyboard(state.data.date, state.data.room),
-      });
+      await updateBookingFlowPanel(
+        state,
+        chatId,
+        `3/5 Время для ${state.data.date} (${formatRoomForDisplay(state.data.room)}):`,
+        timeInlineKeyboard(state.data.date, state.data.room)
+      );
       return answer(query.id);
     }
     if (state.step === "pick_time") {
       state.step = "pick_date";
       const date = state.data.date ? parseDateTime(`${state.data.date} 00:00`) : new Date();
-      bot.sendMessage(chatId, "2/5 Выберите дату:", {
-        reply_markup: calendarInlineKeyboard(date.getFullYear(), date.getMonth() + 1, state.data.date || null),
-      });
+      await updateBookingFlowPanel(
+        state,
+        chatId,
+        "2/5 Выберите дату:",
+        calendarInlineKeyboard(date.getFullYear(), date.getMonth() + 1, state.data.date || null)
+      );
       return answer(query.id);
     }
     if (state.step === "pick_date") {
       state.step = "pick_room";
-      bot.sendMessage(chatId, "1/5 Выберите помещение (на кнопках — макс. число гостей 👥):", {
-        reply_markup: roomInlineKeyboard(),
-      });
+      await updateBookingFlowPanel(
+        state,
+        chatId,
+        "1/5 Выберите помещение (на кнопках — макс. число гостей 👥):",
+        roomInlineKeyboard()
+      );
       return answer(query.id);
     }
     return answer(query.id);
@@ -245,19 +285,26 @@ bot.on("callback_query", (query) => {
     state.data.room = room;
     state.step = "pick_date";
     const today = new Date();
-    bot.sendMessage(chatId, "2/5 Выберите дату:", {
-      reply_markup: calendarInlineKeyboard(today.getFullYear(), today.getMonth() + 1, state.data.date || null),
-    });
+    await updateBookingFlowPanel(
+      state,
+      chatId,
+      "2/5 Выберите дату:",
+      calendarInlineKeyboard(today.getFullYear(), today.getMonth() + 1, state.data.date || null)
+    );
     return answer(query.id);
   }
 
   if (data.startsWith("cal_nav:")) {
     const state = activeStates.get(userId);
-    if (!state || state.step !== "pick_date") return answer(query.id);
+    if (!state || state.step !== "pick_date" || !msg) return answer(query.id);
     const [yearText, monthText] = data.replace("cal_nav:", "").split("-");
     const year = Number(yearText);
     const month = Number(monthText);
     if (Number.isNaN(year) || Number.isNaN(month)) return answer(query.id);
+    if (msg) {
+      state.flowMessageId = msg.message_id;
+      state.flowChatId = chatId;
+    }
     bot
       .editMessageReplyMarkup(calendarInlineKeyboard(year, month, state.data.date || null), {
         chat_id: chatId,
@@ -275,9 +322,16 @@ bot.on("callback_query", (query) => {
     if (Number.isNaN(dayStart.getTime())) return answer(query.id, "Некорректная дата.");
     state.data.date = dateText;
     state.step = "pick_time";
-    bot.sendMessage(chatId, `3/5 Время для ${dateText} (${formatRoomForDisplay(state.data.room)}):`, {
-      reply_markup: timeInlineKeyboard(dateText, state.data.room),
-    });
+    if (msg) {
+      state.flowMessageId = msg.message_id;
+      state.flowChatId = chatId;
+    }
+    await updateBookingFlowPanel(
+      state,
+      chatId,
+      `3/5 Время для ${dateText} (${formatRoomForDisplay(state.data.room)}):`,
+      timeInlineKeyboard(dateText, state.data.room)
+    );
     return answer(query.id);
   }
 
@@ -289,14 +343,13 @@ bot.on("callback_query", (query) => {
     if (isInPast(datetime)) return answer(query.id, "Это время уже прошло.");
     state.data.datetime = datetime;
     state.step = "pick_duration";
-    bot.sendMessage(
+    await updateBookingFlowPanel(
+      state,
       chatId,
       `4/5 Длительность для ${formatDateTime(datetime)} (${formatRoomForDisplay(state.data.room)}). Окончание не позже ${WORK_HOURS_TEXT}:`,
-      {
-        reply_markup: durationInlineKeyboard(state.data.room, datetime),
-      }
+      durationInlineKeyboard(state.data.room, datetime)
     );
-    return answer(query.id);
+    return answer(query.id, `Выбрано: ${time}`);
   }
 
   if (data.startsWith("book_duration:")) {
@@ -309,7 +362,12 @@ bot.on("callback_query", (query) => {
     }
     state.data.durationMinutes = duration;
     state.step = "full_name";
-    bot.sendMessage(chatId, "5/8 Введите ваше ФИО:", { reply_markup: bookingTextControls() });
+    await updateBookingFlowPanel(
+      state,
+      chatId,
+      "5/8 Введите ваше ФИО одним сообщением (текст не будет дублироваться в чате):",
+      bookingTextControls()
+    );
     return answer(query.id, `Выбрано: ${duration} мин`);
   }
 
@@ -317,12 +375,14 @@ bot.on("callback_query", (query) => {
     const state = activeStates.get(userId);
     if (!state || state.step !== "confirm") return answer(query.id, "Сначала завершите заполнение.");
     if (hasApprovedConflict(state.data.room, state.data.datetime, state.data.durationMinutes)) {
+      await deleteBookingFlowMessage(state);
       activeStates.delete(userId);
       bot.sendMessage(chatId, "❌ Пока вы заполняли форму, это время заняли. Создайте заявку заново.");
       sendMainMenu(chatId, userId, "🏠 Главное меню");
       return answer(query.id);
     }
     const booking = addBooking(state.data);
+    await deleteBookingFlowMessage(state);
     activeStates.delete(userId);
     bot.sendMessage(
       chatId,
@@ -336,7 +396,7 @@ bot.on("callback_query", (query) => {
         `Цель: ${booking.purpose}`,
       ].join("\n")
     );
-    notifyAdminsForApproval(booking);
+    notifyAdminsForApproval(booking).catch(() => null);
     sendMainMenu(chatId, userId, "Что делаем дальше?");
     return answer(query.id);
   }
@@ -344,13 +404,21 @@ bot.on("callback_query", (query) => {
   if (data === "book_submit_no") {
     const state = activeStates.get(userId);
     const username = state?.data?.username || query.from.username || query.from.first_name || "unknown";
+    const flowMessageId = state?.flowMessageId;
+    const flowChatId = state?.flowChatId;
     activeStates.set(userId, {
       step: "pick_room",
       data: { userId, username },
+      flowMessageId,
+      flowChatId,
     });
-    bot.sendMessage(chatId, "Окей, заполним заново.\n1/5 Выберите помещение (на кнопках — макс. число гостей 👥):", {
-      reply_markup: roomInlineKeyboard(),
-    });
+    const newState = activeStates.get(userId);
+    await updateBookingFlowPanel(
+      newState,
+      chatId,
+      "Окей, заполним заново.\n1/5 Выберите помещение (на кнопках — макс. число гостей 👥):",
+      roomInlineKeyboard()
+    );
     return answer(query.id);
   }
 
@@ -754,6 +822,33 @@ function formatRoomForDisplay(storedRoom) {
 
 function roomButtonLabel(storedRoom) {
   return ROOM_BUTTON_LABEL[storedRoom] || storedRoom;
+}
+
+/** Одно «панельное» сообщение мастера бронирования — правим его, чтобы не засорять чат. */
+async function deleteBookingFlowMessage(state) {
+  if (!state?.flowMessageId || !state?.flowChatId) return;
+  await bot.deleteMessage(state.flowChatId, state.flowMessageId).catch(() => {});
+  state.flowMessageId = null;
+  state.flowChatId = null;
+}
+
+async function updateBookingFlowPanel(state, chatId, text, replyMarkup) {
+  const opts = { reply_markup: replyMarkup };
+  if (state.flowMessageId && state.flowChatId === chatId) {
+    try {
+      await bot.editMessageText(text, {
+        chat_id: chatId,
+        message_id: state.flowMessageId,
+        ...opts,
+      });
+      return;
+    } catch (_) {
+      /* сообщение слишком старое или то же содержимое — шлём новое */
+    }
+  }
+  const sent = await bot.sendMessage(chatId, text, opts);
+  state.flowMessageId = sent.message_id;
+  state.flowChatId = chatId;
 }
 
 function toHour(input, fallback) {
