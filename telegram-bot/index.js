@@ -1,0 +1,1231 @@
+const fs = require("fs");
+const path = require("path");
+const TelegramBot = require("node-telegram-bot-api");
+require("dotenv").config();
+
+const token = process.env.TELEGRAM_BOT_TOKEN;
+if (!token) throw new Error("Missing TELEGRAM_BOT_TOKEN in environment");
+
+const ADMIN_USER_IDS = (process.env.ADMIN_USER_IDS || "")
+  .split(",")
+  .map((x) => Number(x.trim()))
+  .filter((x) => !Number.isNaN(x));
+const WORK_START_HOUR = toHour(process.env.WORK_START_HOUR, 8);
+const WORK_END_HOUR = toHour(process.env.WORK_END_HOUR, 20);
+const REMINDER_MINUTES_BEFORE = toPositiveInt(process.env.REMINDER_MINUTES_BEFORE, 30);
+const PENDING_TTL_HOURS = toPositiveInt(process.env.PENDING_TTL_HOURS, 24);
+
+// Локально: telegram-bot/data. На Amvera и др.: задайте DATA_DIR=/data (абсолютный путь к постоянному диску).
+const DATA_DIR = process.env.DATA_DIR
+  ? path.resolve(process.env.DATA_DIR)
+  : path.join(__dirname, "data");
+const BOOKINGS_FILE = path.join(DATA_DIR, "bookings.json");
+const ROOM_OPTIONS = ["Конференц-зал", "Общий-зал", "Актовый-зал"];
+const WEEK_DAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
+const MONTHS_RU = [
+  "Январь",
+  "Февраль",
+  "Март",
+  "Апрель",
+  "Май",
+  "Июнь",
+  "Июль",
+  "Август",
+  "Сентябрь",
+  "Октябрь",
+  "Ноябрь",
+  "Декабрь",
+];
+const activeStates = new Map();
+
+const HELP_TEXT_BASE = [
+  "🏢 Бот бронирования помещения",
+  "",
+  "• Выбор даты через календарь",
+  "• Выбор времени удобными слотами",
+  "• Заявки проходят согласование админа",
+  "",
+  "Команды:",
+  "/start — главное меню",
+  "/free_now — свободно сейчас",
+  "/weekly_load — загрузка залов за неделю",
+].join("\n");
+
+ensureStorage();
+const bot = new TelegramBot(token, { polling: true });
+
+bot.onText(/^\/start$/, (msg) => {
+  sendMainMenu(msg.chat.id, msg.from.id, "🏠 Главное меню");
+});
+
+bot.onText(/^\/help$/, (msg) => {
+  bot.sendMessage(msg.chat.id, getHelpText(msg.from.id));
+});
+
+bot.onText(/^\/free_now$/, (msg) => {
+  sendFreeNow(msg.chat.id);
+});
+
+bot.onText(/^\/weekly_load$/, (msg) => {
+  sendWeeklyLoad(msg.chat.id);
+});
+
+bot.onText(/^\/admin$/, (msg) => {
+  if (!isAdmin(msg.from.id)) {
+    bot.sendMessage(msg.chat.id, "⛔ Админ-панель доступна только администраторам.");
+    return;
+  }
+  sendAdminMenu(msg.chat.id);
+});
+
+bot.on("message", (msg) => {
+  if (!msg.text || msg.text.startsWith("/")) return;
+  const state = activeStates.get(msg.from.id);
+  if (!state) {
+    sendMainMenu(msg.chat.id, msg.from.id, "Используйте меню кнопок:");
+    return;
+  }
+
+  if (!["full_name", "phone", "purpose"].includes(state.step)) {
+    bot.sendMessage(msg.chat.id, "Используйте кнопки для выбора даты, времени и длительности.");
+    return;
+  }
+
+  if (state.step === "full_name") {
+    const fullName = msg.text.trim();
+    if (fullName.length < 5) {
+      bot.sendMessage(msg.chat.id, "Введите ФИО полностью (минимум 5 символов).");
+      return;
+    }
+    state.data.fullName = fullName;
+    state.step = "phone";
+    bot.sendMessage(msg.chat.id, "6/7 Введите номер телефона для связи (например: +79991234567):", {
+      reply_markup: bookingTextControls(),
+    });
+    return;
+  }
+
+  if (state.step === "phone") {
+    const phone = msg.text.trim();
+    if (!isValidPhone(phone)) {
+      bot.sendMessage(msg.chat.id, "Некорректный номер. Пример: +79991234567");
+      return;
+    }
+    state.data.phone = phone;
+    state.step = "purpose";
+    bot.sendMessage(msg.chat.id, "7/7 Напишите цель бронирования:", {
+      reply_markup: bookingTextControls(),
+    });
+    return;
+  }
+
+  const purpose = msg.text.trim();
+  if (!purpose) {
+    bot.sendMessage(msg.chat.id, "Цель не может быть пустой.");
+    return;
+  }
+  state.data.purpose = purpose;
+
+  state.step = "confirm";
+  bot.sendMessage(msg.chat.id, buildBookingPreview(state.data), {
+    reply_markup: confirmInlineKeyboard(),
+  });
+});
+
+bot.on("callback_query", (query) => {
+  const data = query.data || "";
+  const msg = query.message;
+  const chatId = msg ? msg.chat.id : query.from.id;
+  const userId = query.from.id;
+
+  if (data === "menu") {
+    activeStates.delete(userId);
+    sendMainMenu(chatId, userId, "🏠 Главное меню");
+    return answer(query.id);
+  }
+
+  if (data === "menu_help") {
+    bot.sendMessage(chatId, getHelpText(userId), {
+      reply_markup: {
+        inline_keyboard: [[{ text: "🏠 Главное меню", callback_data: "menu" }]],
+      },
+    });
+    return answer(query.id);
+  }
+
+  if (data === "free_now") {
+    sendFreeNow(chatId);
+    return answer(query.id);
+  }
+
+  if (data === "weekly_load") {
+    sendWeeklyLoad(chatId);
+    return answer(query.id);
+  }
+
+  if (data === "noop") {
+    return answer(query.id);
+  }
+
+  if (data === "book_start") {
+    activeStates.set(userId, {
+      step: "pick_room",
+      data: { userId, username: query.from.username || query.from.first_name || "unknown" },
+    });
+    bot.sendMessage(chatId, "1/5 Выберите помещение:", { reply_markup: roomInlineKeyboard() });
+    return answer(query.id);
+  }
+
+  if (data === "book_back") {
+    const state = activeStates.get(userId);
+    if (!state) return answer(query.id, "Нет активного бронирования.");
+    if (state.step === "phone") {
+      state.step = "full_name";
+      bot.sendMessage(chatId, "5/8 Введите ваше ФИО:", { reply_markup: bookingTextControls() });
+      return answer(query.id);
+    }
+    if (state.step === "purpose") {
+      state.step = "phone";
+      bot.sendMessage(chatId, "6/7 Введите номер телефона:", { reply_markup: bookingTextControls() });
+      return answer(query.id);
+    }
+    if (state.step === "confirm") {
+      state.step = "purpose";
+      bot.sendMessage(chatId, "7/7 Напишите цель бронирования:", { reply_markup: bookingTextControls() });
+      return answer(query.id);
+    }
+    if (state.step === "pick_duration") {
+      state.step = "pick_time";
+      bot.sendMessage(chatId, `3/5 Время для ${state.data.date}:`, {
+        reply_markup: timeInlineKeyboard(state.data.date, state.data.room),
+      });
+      return answer(query.id);
+    }
+    if (state.step === "pick_time") {
+      state.step = "pick_date";
+      const date = state.data.date ? parseDateTime(`${state.data.date} 00:00`) : new Date();
+      bot.sendMessage(chatId, "2/5 Выберите дату:", {
+        reply_markup: calendarInlineKeyboard(date.getFullYear(), date.getMonth() + 1, state.data.date || null),
+      });
+      return answer(query.id);
+    }
+    if (state.step === "pick_date") {
+      state.step = "pick_room";
+      bot.sendMessage(chatId, "1/5 Выберите помещение:", { reply_markup: roomInlineKeyboard() });
+      return answer(query.id);
+    }
+    return answer(query.id);
+  }
+
+  if (data.startsWith("book_room:")) {
+    const state = activeStates.get(userId);
+    if (!state) return answer(query.id, "Начните заново через меню.");
+    state.data.room = data.replace("book_room:", "");
+    state.step = "pick_date";
+    const today = new Date();
+    bot.sendMessage(chatId, "2/5 Выберите дату:", {
+      reply_markup: calendarInlineKeyboard(today.getFullYear(), today.getMonth() + 1, state.data.date || null),
+    });
+    return answer(query.id);
+  }
+
+  if (data.startsWith("cal_nav:")) {
+    const state = activeStates.get(userId);
+    if (!state || state.step !== "pick_date") return answer(query.id);
+    const [yearText, monthText] = data.replace("cal_nav:", "").split("-");
+    const year = Number(yearText);
+    const month = Number(monthText);
+    if (Number.isNaN(year) || Number.isNaN(month)) return answer(query.id);
+    bot
+      .editMessageReplyMarkup(calendarInlineKeyboard(year, month, state.data.date || null), {
+        chat_id: chatId,
+        message_id: msg.message_id,
+      })
+      .catch(() => {});
+    return answer(query.id);
+  }
+
+  if (data.startsWith("cal_day:")) {
+    const state = activeStates.get(userId);
+    if (!state || !state.data.room) return answer(query.id, "Начните заново через меню.");
+    const dateText = data.replace("cal_day:", "");
+    const dayStart = parseDateTime(`${dateText} 00:00`);
+    if (Number.isNaN(dayStart.getTime())) return answer(query.id, "Некорректная дата.");
+    state.data.date = dateText;
+    state.step = "pick_time";
+    bot.sendMessage(chatId, `3/5 Время для ${dateText}:`, { reply_markup: timeInlineKeyboard(dateText, state.data.room) });
+    return answer(query.id);
+  }
+
+  if (data.startsWith("book_time:")) {
+    const state = activeStates.get(userId);
+    if (!state || !state.data.date) return answer(query.id, "Сначала выберите дату.");
+    const time = data.replace("book_time:", "");
+    const datetime = `${state.data.date} ${time}`;
+    if (isInPast(datetime)) return answer(query.id, "Это время уже прошло.");
+    state.data.datetime = datetime;
+    state.step = "pick_duration";
+    bot.sendMessage(chatId, `4/5 Длительность для ${formatDateTime(datetime)}:`, {
+      reply_markup: durationInlineKeyboard(state.data.room, datetime),
+    });
+    return answer(query.id);
+  }
+
+  if (data.startsWith("book_duration:")) {
+    const state = activeStates.get(userId);
+    if (!state || !state.data.datetime) return answer(query.id, "Сначала выберите дату и время.");
+    const duration = Number(data.replace("book_duration:", ""));
+    if (Number.isNaN(duration) || duration <= 0) return answer(query.id, "Некорректная длительность.");
+    if (!isWithinWorkingHoursWithDuration(state.data.datetime, duration)) {
+      return answer(query.id, "Интервал выходит за рабочее время.");
+    }
+    state.data.durationMinutes = duration;
+    state.step = "full_name";
+    bot.sendMessage(chatId, "5/8 Введите ваше ФИО:", { reply_markup: bookingTextControls() });
+    return answer(query.id, `Выбрано: ${duration} мин`);
+  }
+
+  if (data === "book_submit_yes") {
+    const state = activeStates.get(userId);
+    if (!state || state.step !== "confirm") return answer(query.id, "Сначала завершите заполнение.");
+    if (hasApprovedConflict(state.data.room, state.data.datetime, state.data.durationMinutes)) {
+      activeStates.delete(userId);
+      bot.sendMessage(chatId, "❌ Пока вы заполняли форму, это время заняли. Создайте заявку заново.");
+      sendMainMenu(chatId, userId, "🏠 Главное меню");
+      return answer(query.id);
+    }
+    const booking = addBooking(state.data);
+    activeStates.delete(userId);
+    bot.sendMessage(
+      chatId,
+      [
+        "✅ Заявка отправлена администратору",
+        `ID: ${booking.id}`,
+        `Помещение: ${booking.room}`,
+        `Время: ${formatRange(booking.datetime, booking.durationMinutes)}`,
+        `ФИО: ${booking.fullName}`,
+        `Телефон: ${booking.phone}`,
+        `Цель: ${booking.purpose}`,
+      ].join("\n")
+    );
+    notifyAdminsForApproval(booking);
+    sendMainMenu(chatId, userId, "Что делаем дальше?");
+    return answer(query.id);
+  }
+
+  if (data === "book_submit_no") {
+    const state = activeStates.get(userId);
+    const username = state?.data?.username || query.from.username || query.from.first_name || "unknown";
+    activeStates.set(userId, {
+      step: "pick_room",
+      data: { userId, username },
+    });
+    bot.sendMessage(chatId, "Окей, заполним заново.\n1/5 Выберите помещение:", {
+      reply_markup: roomInlineKeyboard(),
+    });
+    return answer(query.id);
+  }
+
+  if (data === "my_bookings") {
+    sendMyBookings(chatId, userId);
+    return answer(query.id);
+  }
+
+  if (data === "my_pending") {
+    sendMyPending(chatId, userId);
+    return answer(query.id);
+  }
+
+  if (data === "schedule") {
+    sendSchedule(chatId);
+    return answer(query.id);
+  }
+
+  if (data === "cancel_pick") {
+    sendCancelOptions(chatId, userId);
+    return answer(query.id);
+  }
+
+  if (data.startsWith("cancel:")) {
+    const bookingId = Number(data.replace("cancel:", ""));
+    const removedBooking = removeBooking(bookingId, userId);
+    if (!removedBooking) return answer(query.id, "Бронь не найдена.");
+    bot.sendMessage(chatId, `🗑 Бронь #${bookingId} отменена.`);
+    notifyAdminsCancelled(removedBooking);
+    sendMainMenu(chatId, userId, "Готово.");
+    return answer(query.id);
+  }
+
+  if (data === "admin_menu") {
+    if (!isAdmin(userId)) return answer(query.id, "Только для админа.");
+    sendAdminMenu(chatId);
+    return answer(query.id);
+  }
+
+  if (data === "admin_pending") {
+    if (!isAdmin(userId)) return answer(query.id, "Только для админа.");
+    sendAdminPending(chatId);
+    return answer(query.id);
+  }
+
+  if (data === "admin_schedule") {
+    if (!isAdmin(userId)) return answer(query.id, "Только для админа.");
+    sendAdminSchedule(chatId);
+    return answer(query.id);
+  }
+
+  if (data === "admin_archive") {
+    if (!isAdmin(userId)) return answer(query.id, "Только для админа.");
+    sendAdminArchive(chatId);
+    return answer(query.id);
+  }
+
+  if (data === "admin_history") {
+    if (!isAdmin(userId)) return answer(query.id, "Только для админа.");
+    sendAdminHistory(chatId);
+    return answer(query.id);
+  }
+
+  if (data === "admin_delete_pick") {
+    if (!isAdmin(userId)) return answer(query.id, "Только для админа.");
+    sendAdminDeleteOptions(chatId);
+    return answer(query.id);
+  }
+
+  if (data.startsWith("admin_cancel:")) {
+    if (!isAdmin(userId)) return answer(query.id, "Только для админа.");
+    const bookingId = Number(data.replace("admin_cancel:", ""));
+    if (Number.isNaN(bookingId)) return answer(query.id, "Некорректный ID.");
+    const removedBooking = removeBookingByAdmin(bookingId);
+    if (!removedBooking) return answer(query.id, "Бронь не найдена.");
+    addAdminActionLog("cancelled", removedBooking, query.from);
+    bot.sendMessage(chatId, `🗑 Бронь #${bookingId} удалена администратором.`);
+    notifyUserBookingCancelledByAdmin(removedBooking);
+    return answer(query.id, "Удалено");
+  }
+
+  const [action, idText] = data.split(":");
+  if (action === "approve" || action === "reject") {
+    if (!isAdmin(userId)) return answer(query.id, "Только для админа.");
+    const bookingId = Number(idText);
+    const result = updateBookingStatusByAdmin(bookingId, action === "approve" ? "approved" : "rejected");
+    if (!result.ok) return answer(query.id, result.message);
+    addAdminActionLog(action === "approve" ? "approved" : "rejected", result.booking, query.from);
+    bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: chatId, message_id: msg.message_id }).catch(() => {});
+    bot.sendMessage(chatId, `Заявка #${bookingId} ${action === "approve" ? "подтверждена ✅" : "отклонена ❌"}.`);
+    notifyUserBookingStatus(result.booking, action === "approve" ? "approved" : "rejected");
+    if (action === "approve" && Array.isArray(result.autoRejected) && result.autoRejected.length > 0) {
+      for (const rejected of result.autoRejected) {
+        addAdminActionLog("rejected", rejected, query.from);
+        notifyUserBookingStatus(rejected, "rejected_auto_conflict");
+      }
+      bot.sendMessage(chatId, `Авто-отклонено пересекающихся pending-заявок: ${result.autoRejected.length}.`);
+    }
+    return answer(query.id);
+  }
+
+  return answer(query.id, "Неизвестное действие.");
+});
+
+bot.on("polling_error", (error) => {
+  console.error("Polling error:", error.message);
+});
+
+setInterval(() => {
+  sendUpcomingReminders().catch((error) => console.error("Reminder error:", error.message));
+  cleanupExpiredPending().catch((error) => console.error("Pending cleanup error:", error.message));
+}, 30000);
+
+console.log("Telegram booking bot is running...");
+
+function answer(callbackQueryId, text) {
+  const promise = !text
+    ? bot.answerCallbackQuery(callbackQueryId)
+    : bot.answerCallbackQuery(callbackQueryId, { text });
+
+  return promise.catch((error) => {
+    const message = error?.message || "";
+    if (
+      message.includes("query is too old") ||
+      message.includes("query ID is invalid") ||
+      message.includes("response timeout expired")
+    ) {
+      return null;
+    }
+    console.error("answerCallbackQuery error:", message);
+    return null;
+  });
+}
+
+function ensureStorage() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (!fs.existsSync(BOOKINGS_FILE)) {
+    fs.writeFileSync(BOOKINGS_FILE, JSON.stringify({ nextId: 1, bookings: [], actionLog: [] }, null, 2));
+    return;
+  }
+  migrateStorageIfNeeded();
+}
+
+function migrateStorageIfNeeded() {
+  const data = readBookings();
+  let changed = false;
+  if (!Array.isArray(data.actionLog)) {
+    data.actionLog = [];
+    changed = true;
+  }
+  for (const booking of data.bookings) {
+    if (!booking.status) {
+      booking.status = "approved";
+      changed = true;
+    }
+    if (!booking.reminderSentAt) {
+      booking.reminderSentAt = null;
+      changed = true;
+    }
+    if (!booking.durationMinutes) {
+      booking.durationMinutes = 60;
+      changed = true;
+    }
+  }
+  if (changed) writeBookings(data);
+}
+
+function readBookings() {
+  return JSON.parse(fs.readFileSync(BOOKINGS_FILE, "utf8"));
+}
+
+function writeBookings(data) {
+  fs.writeFileSync(BOOKINGS_FILE, JSON.stringify(data, null, 2));
+}
+
+function addBooking(input) {
+  const data = readBookings();
+  const booking = {
+    id: data.nextId++,
+    userId: input.userId,
+    username: input.username,
+    room: input.room,
+    datetime: input.datetime,
+    durationMinutes: input.durationMinutes,
+    fullName: input.fullName,
+    phone: input.phone,
+    purpose: input.purpose,
+    status: "pending",
+    reminderSentAt: null,
+    createdAt: new Date().toISOString(),
+  };
+  data.bookings.push(booking);
+  writeBookings(data);
+  return booking;
+}
+
+function removeBooking(id, userId) {
+  const data = readBookings();
+  const idx = data.bookings.findIndex((b) => b.id === id && b.userId === userId && (b.status === "pending" || b.status === "approved"));
+  if (idx === -1) return null;
+  const [removed] = data.bookings.splice(idx, 1);
+  writeBookings(data);
+  return removed;
+}
+
+function removeBookingByAdmin(id) {
+  const data = readBookings();
+  const idx = data.bookings.findIndex((b) => b.id === id);
+  if (idx === -1) return null;
+  const [removed] = data.bookings.splice(idx, 1);
+  writeBookings(data);
+  return removed;
+}
+
+function hasApprovedConflict(room, datetime, durationMinutes) {
+  const data = readBookings();
+  const start = parseDateTime(datetime);
+  return data.bookings.some((b) => {
+    if (b.room !== room || b.status !== "approved") return false;
+    return areOverlapping(start, durationMinutes, parseDateTime(b.datetime), b.durationMinutes || 60);
+  });
+}
+
+function updateBookingStatusByAdmin(id, newStatus) {
+  const data = readBookings();
+  const booking = data.bookings.find((b) => b.id === id);
+  if (!booking) return { ok: false, message: "Бронь не найдена." };
+  if (booking.status !== "pending") return { ok: false, message: "Эта заявка уже обработана." };
+  if (newStatus === "approved" && hasApprovedConflict(booking.room, booking.datetime, booking.durationMinutes || 60)) {
+    return { ok: false, message: "Слот уже занят подтвержденной бронью." };
+  }
+  booking.status = newStatus;
+  booking.reviewedAt = new Date().toISOString();
+  const autoRejected = [];
+
+  if (newStatus === "approved") {
+    const approvedStart = parseDateTime(booking.datetime);
+    const approvedDuration = booking.durationMinutes || 60;
+    for (const candidate of data.bookings) {
+      if (candidate.id === booking.id) continue;
+      if (candidate.status !== "pending") continue;
+      if (candidate.room !== booking.room) continue;
+      const overlap = areOverlapping(
+        approvedStart,
+        approvedDuration,
+        parseDateTime(candidate.datetime),
+        candidate.durationMinutes || 60
+      );
+      if (!overlap) continue;
+      candidate.status = "rejected";
+      candidate.reviewedAt = new Date().toISOString();
+      candidate.rejectReason = "auto_conflict_after_approval";
+      autoRejected.push(candidate);
+    }
+  }
+
+  writeBookings(data);
+  return { ok: true, booking, autoRejected };
+}
+
+async function notifyAdminsForApproval(booking) {
+  for (const adminId of ADMIN_USER_IDS) {
+    await bot.sendMessage(
+      adminId,
+      [
+        "🔔 Новая заявка",
+        `ID: ${booking.id}`,
+        `Пользователь: ${booking.username}`,
+        `ФИО: ${booking.fullName}`,
+        `Телефон: ${booking.phone}`,
+        `Помещение: ${booking.room}`,
+        `Время: ${formatRange(booking.datetime, booking.durationMinutes)}`,
+        `Цель: ${booking.purpose}`,
+      ].join("\n"),
+      {
+        reply_markup: {
+          inline_keyboard: [[
+            { text: "✅ Подтвердить", callback_data: `approve:${booking.id}` },
+            { text: "❌ Отклонить", callback_data: `reject:${booking.id}` },
+          ]],
+        },
+      }
+    );
+  }
+}
+
+async function notifyAdminsCancelled(booking) {
+  for (const adminId of ADMIN_USER_IDS) {
+    await bot.sendMessage(adminId, `Пользователь ${booking.username} отменил бронь #${booking.id}.`);
+  }
+}
+
+async function notifyUserBookingCancelledByAdmin(booking) {
+  const text = [
+    `❌ Ваша бронь #${booking.id} была отменена администратором.`,
+    `${booking.room} | ${formatRange(booking.datetime, booking.durationMinutes)}`,
+  ].join("\n");
+  await bot.sendMessage(booking.userId, text);
+}
+
+async function notifyUserBookingStatus(booking, status) {
+  let text;
+  if (status === "approved") {
+    text = `✅ Ваша бронь #${booking.id} подтверждена.\n${booking.room} | ${formatRange(booking.datetime, booking.durationMinutes)}`;
+  } else if (status === "rejected_auto_conflict") {
+    text = `❌ Ваша заявка #${booking.id} отклонена автоматически, потому что пересекается с уже подтвержденной бронью.\n${booking.room} | ${formatRange(
+      booking.datetime,
+      booking.durationMinutes
+    )}`;
+  } else {
+    text = `❌ Ваша бронь #${booking.id} отклонена.\n${booking.room} | ${formatRange(booking.datetime, booking.durationMinutes)}`;
+  }
+  await bot.sendMessage(booking.userId, text);
+}
+
+async function sendUpcomingReminders() {
+  const data = readBookings();
+  let changed = false;
+  const now = Date.now();
+
+  for (const booking of data.bookings) {
+    if (booking.status !== "approved" || booking.reminderSentAt) continue;
+    const diffMs = parseDateTime(booking.datetime).getTime() - now;
+    if (diffMs <= REMINDER_MINUTES_BEFORE * 60000 && diffMs > 0) {
+      await bot.sendMessage(
+        booking.userId,
+        `⏰ Напоминание: через ${REMINDER_MINUTES_BEFORE} мин начинается бронь #${booking.id} (${booking.room}, ${formatRange(
+          booking.datetime,
+          booking.durationMinutes
+        )}).`
+      );
+      booking.reminderSentAt = new Date().toISOString();
+      changed = true;
+    }
+  }
+
+  if (changed) writeBookings(data);
+}
+
+async function cleanupExpiredPending() {
+  const data = readBookings();
+  const now = Date.now();
+  const ttlMs = PENDING_TTL_HOURS * 60 * 60 * 1000;
+  const expired = data.bookings.filter((b) => b.status === "pending" && new Date(b.createdAt).getTime() + ttlMs <= now);
+  if (expired.length === 0) return;
+
+  data.bookings = data.bookings.filter((b) => !(b.status === "pending" && new Date(b.createdAt).getTime() + ttlMs <= now));
+  writeBookings(data);
+
+  for (const b of expired) {
+    await bot
+      .sendMessage(
+        b.userId,
+        `⌛ Ваша заявка #${b.id} автоматически закрыта, потому что не была подтверждена в течение ${PENDING_TTL_HOURS} часов.`
+      )
+      .catch(() => null);
+  }
+}
+
+function isWithinWorkingHoursWithDuration(datetimeText, durationMinutes) {
+  const start = parseDateTime(datetimeText);
+  const end = new Date(start.getTime() + durationMinutes * 60000);
+  const endHour = end.getHours() + (end.getMinutes() > 0 ? 1 : 0);
+  return start.getHours() >= WORK_START_HOUR && endHour <= WORK_END_HOUR;
+}
+
+function isInPast(datetimeText) {
+  return parseDateTime(datetimeText).getTime() <= Date.now();
+}
+
+function parseDateTime(datetimeText) {
+  return new Date(`${datetimeText.replace(" ", "T")}:00`);
+}
+
+function formatDateTime(datetimeText) {
+  return datetimeText.replace(" ", " в ");
+}
+
+function formatRange(datetimeText, durationMinutes) {
+  const end = new Date(parseDateTime(datetimeText).getTime() + (durationMinutes || 60) * 60000);
+  return `${formatDateTime(datetimeText)} - ${toHHMM(end)}`;
+}
+
+function toHHMM(date) {
+  return `${`${date.getHours()}`.padStart(2, "0")}:${`${date.getMinutes()}`.padStart(2, "0")}`;
+}
+
+function statusLabel(status) {
+  if (status === "approved") return "подтверждена";
+  if (status === "rejected") return "отклонена";
+  return "ожидает подтверждения";
+}
+
+function isAdmin(userId) {
+  return ADMIN_USER_IDS.includes(userId);
+}
+
+function toHour(input, fallback) {
+  const value = Number(input);
+  if (Number.isNaN(value) || value < 0 || value > 23) return fallback;
+  return value;
+}
+
+function toPositiveInt(input, fallback) {
+  const value = Number(input);
+  if (Number.isNaN(value) || value <= 0) return fallback;
+  return Math.floor(value);
+}
+
+function areOverlapping(startA, durA, startB, durB) {
+  const endA = new Date(startA.getTime() + durA * 60000);
+  const endB = new Date(startB.getTime() + durB * 60000);
+  return startA < endB && startB < endA;
+}
+
+function sendMainMenu(chatId, userId, title) {
+  const rows = [
+    [{ text: "📅 Создать бронь", callback_data: "book_start" }],
+    [
+      { text: "🟢 Свободно сейчас", callback_data: "free_now" },
+      { text: "📊 Загрузка за неделю", callback_data: "weekly_load" },
+    ],
+    [
+      { text: "📋 Мои брони", callback_data: "my_bookings" },
+      { text: "🕓 Мои заявки", callback_data: "my_pending" },
+    ],
+    [
+      { text: "🗓 Расписание", callback_data: "schedule" },
+      { text: "🗑 Отменить", callback_data: "cancel_pick" },
+    ],
+    [{ text: "ℹ️ Помощь", callback_data: "menu_help" }],
+  ];
+  if (isAdmin(userId)) rows.push([{ text: "🛠 Админ-панель", callback_data: "admin_menu" }]);
+  bot.sendMessage(chatId, title, { reply_markup: { inline_keyboard: rows } });
+}
+
+function sendAdminMenu(chatId) {
+  bot.sendMessage(chatId, "🛠 Админ-панель", {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "⏳ Заявки на согласование", callback_data: "admin_pending" }],
+        [{ text: "🗓 Подтвержденное расписание", callback_data: "admin_schedule" }],
+        [{ text: "🗂 Архив завершенных броней", callback_data: "admin_archive" }],
+        [{ text: "🗑 Удалить бронь пользователя", callback_data: "admin_delete_pick" }],
+        [{ text: "📜 История действий", callback_data: "admin_history" }],
+        [{ text: "🏠 В главное меню", callback_data: "menu" }],
+      ],
+    },
+  });
+}
+
+function roomInlineKeyboard() {
+  const rows = ROOM_OPTIONS.map((room) => [{ text: room, callback_data: `book_room:${room}` }]);
+  rows.push([{ text: "🏠 В меню", callback_data: "menu" }]);
+  return { inline_keyboard: rows };
+}
+
+function calendarInlineKeyboard(year, month, selectedDate) {
+  const today = startOfDay(new Date());
+  const first = new Date(year, month - 1, 1);
+  const firstWeekday = (first.getDay() + 6) % 7;
+  const daysInMonth = new Date(year, month, 0).getDate();
+  const rows = [];
+
+  rows.push([
+    { text: "« Год", callback_data: `cal_nav:${year - 1}-${month}` },
+    { text: `${MONTHS_RU[month - 1]} ${year}`, callback_data: "noop" },
+    { text: "Год »", callback_data: `cal_nav:${year + 1}-${month}` },
+  ]);
+  rows.push(WEEK_DAYS.map((w) => ({ text: w, callback_data: "noop" })));
+
+  let day = 1;
+  for (let week = 0; week < 6; week += 1) {
+    const row = [];
+    for (let wd = 0; wd < 7; wd += 1) {
+      if ((week === 0 && wd < firstWeekday) || day > daysInMonth) {
+        row.push({ text: " ", callback_data: "noop" });
+        continue;
+      }
+      const date = new Date(year, month - 1, day);
+      const dateText = formatDate(date);
+      let text = `${day}`;
+      if (startOfDay(date).getTime() < today.getTime()) {
+        row.push({ text: `·${text}`, callback_data: "noop" });
+      } else {
+        if (selectedDate && selectedDate === dateText) {
+          text = `[${day}]`;
+        }
+        row.push({ text, callback_data: `cal_day:${dateText}` });
+      }
+      day += 1;
+    }
+    rows.push(row);
+    if (day > daysInMonth) break;
+  }
+
+  const prev = new Date(year, month - 2, 1);
+  const next = new Date(year, month, 1);
+  rows.push([
+    { text: "◀", callback_data: `cal_nav:${prev.getFullYear()}-${prev.getMonth() + 1}` },
+    { text: "Сегодня", callback_data: `cal_day:${formatDate(today)}` },
+    { text: "▶", callback_data: `cal_nav:${next.getFullYear()}-${next.getMonth() + 1}` },
+  ]);
+  rows.push([
+    { text: "⬅ Назад", callback_data: "book_back" },
+    { text: "🏠 В меню", callback_data: "menu" },
+  ]);
+  return { inline_keyboard: rows };
+}
+
+function timeInlineKeyboard(dateText, room) {
+  const rows = [];
+  const times = [];
+  for (let hour = WORK_START_HOUR; hour < WORK_END_HOUR; hour += 1) {
+    times.push(`${`${hour}`.padStart(2, "0")}:00`);
+    times.push(`${`${hour}`.padStart(2, "0")}:30`);
+  }
+
+  const available = times.filter((time) => {
+    const datetime = `${dateText} ${time}`;
+    if (isInPast(datetime)) return false;
+    // Hide slots that are already occupied for a common 60-minute booking.
+    return !hasApprovedConflict(room, datetime, 60);
+  });
+  for (let i = 0; i < available.length; i += 3) {
+    rows.push(
+      available.slice(i, i + 3).map((time) => ({
+        text: time,
+        callback_data: `book_time:${time}`,
+      }))
+    );
+  }
+  if (rows.length === 0) rows.push([{ text: "Нет свободных слотов", callback_data: "noop" }]);
+  rows.push([
+    { text: "⬅ Назад", callback_data: "book_back" },
+    { text: "🏠 В меню", callback_data: "menu" },
+  ]);
+  return { inline_keyboard: rows };
+}
+
+function durationInlineKeyboard(room, datetime) {
+  const options = [30, 60, 90, 120, 180];
+  const available = options.filter((minutes) => {
+    if (!isWithinWorkingHoursWithDuration(datetime, minutes)) return false;
+    return !hasApprovedConflict(room, datetime, minutes);
+  });
+
+  const rows = [];
+  for (let i = 0; i < available.length; i += 3) {
+    rows.push(
+      available.slice(i, i + 3).map((minutes) => ({
+        text: `${minutes} мин`,
+        callback_data: `book_duration:${minutes}`,
+      }))
+    );
+  }
+  if (rows.length === 0) {
+    rows.push([{ text: "Нет доступной длительности", callback_data: "noop" }]);
+  }
+  rows.push([
+    { text: "⬅ Назад", callback_data: "book_back" },
+    { text: "🏠 В меню", callback_data: "menu" },
+  ]);
+  return { inline_keyboard: rows };
+}
+
+function sendMyBookings(chatId, userId) {
+  const data = readBookings();
+  const myBookings = data.bookings.filter((b) => b.userId === userId);
+  if (myBookings.length === 0) return bot.sendMessage(chatId, "У вас пока нет броней.", { reply_markup: userNavKeyboard() });
+  const text = myBookings
+    .sort((a, b) => (a.datetime > b.datetime ? 1 : -1))
+    .map(
+      (b, i) =>
+        `${i + 1}) 📅 ${formatRange(b.datetime, b.durationMinutes)}\n🏢 Помещение: ${b.room}\n🎯 Мероприятие: ${
+          b.purpose
+        }\n📌 Статус: ${statusLabel(b.status)}`
+    )
+    .join("\n\n");
+  bot.sendMessage(chatId, `📋 Ваши брони:\n\n${text}`, { reply_markup: userNavKeyboard() });
+}
+
+function sendMyPending(chatId, userId) {
+  const data = readBookings();
+  const pending = data.bookings.filter((b) => b.userId === userId && b.status === "pending");
+  if (pending.length === 0) return bot.sendMessage(chatId, "У вас нет заявок на согласовании.", { reply_markup: userNavKeyboard() });
+  const text = pending
+    .sort((a, b) => (a.datetime > b.datetime ? 1 : -1))
+    .map(
+      (b, i) =>
+        `${i + 1}) 📅 ${formatRange(b.datetime, b.durationMinutes)}\n🏢 Помещение: ${b.room}\n🎯 Мероприятие: ${
+          b.purpose
+        }\n📌 Статус: ожидает подтверждения`
+    )
+    .join("\n\n");
+  bot.sendMessage(chatId, `🕓 Ваши заявки:\n\n${text}`, { reply_markup: userNavKeyboard() });
+}
+
+function sendSchedule(chatId) {
+  const data = readBookings();
+  const sorted = data.bookings
+    .filter((b) => b.status === "approved" && !isBookingFinished(b))
+    .sort((a, b) => (a.datetime > b.datetime ? 1 : -1));
+  if (sorted.length === 0) return bot.sendMessage(chatId, "Сейчас нет активных и будущих броней.", { reply_markup: userNavKeyboard() });
+  const text = sorted
+    .map(
+      (b, i) =>
+        `${i + 1}) 📅 ${formatRange(b.datetime, b.durationMinutes)}\n🏢 Помещение: ${b.room}\n🎯 Мероприятие: ${b.purpose || "-"}`
+    )
+    .join("\n\n");
+  bot.sendMessage(chatId, `🗓 Расписание бронирований:\n\n${text}`, { reply_markup: userNavKeyboard() });
+}
+
+function sendAdminSchedule(chatId) {
+  const data = readBookings();
+  const sorted = data.bookings
+    .filter((b) => b.status === "approved" && !isBookingFinished(b))
+    .sort((a, b) => (a.datetime > b.datetime ? 1 : -1));
+  if (sorted.length === 0) return bot.sendMessage(chatId, "Нет активных подтвержденных броней.", { reply_markup: adminNavKeyboard() });
+  const text = sorted
+    .map(
+      (b) =>
+        `#${b.id} | ${formatRange(b.datetime, b.durationMinutes)} | ${b.room}\nЮзер: ${formatUserTag(
+          b.username
+        )} (ID: ${b.userId})\nФИО: ${b.fullName || "-"} | Тел: ${b.phone || "-"}`
+    )
+    .join("\n\n");
+  bot.sendMessage(chatId, `🗓 Подтвержденное расписание (админ):\n\n${text}`, { reply_markup: adminNavKeyboard() });
+}
+
+function sendAdminArchive(chatId) {
+  const data = readBookings();
+  const archived = data.bookings
+    .filter((b) => b.status === "approved" && isBookingFinished(b))
+    .sort((a, b) => (a.datetime < b.datetime ? 1 : -1));
+  if (archived.length === 0) {
+    bot.sendMessage(chatId, "Архив завершенных броней пока пуст.", { reply_markup: adminNavKeyboard() });
+    return;
+  }
+  const text = archived
+    .slice(0, 50)
+    .map(
+      (b) =>
+        `#${b.id} | ${formatRange(b.datetime, b.durationMinutes)} | ${b.room}\nЮзер: ${formatUserTag(
+          b.username
+        )} (ID: ${b.userId})\nФИО: ${b.fullName || "-"} | Тел: ${b.phone || "-"}`
+    )
+    .join("\n\n");
+  bot.sendMessage(chatId, `🗂 Архив завершенных броней:\n\n${text}`, { reply_markup: adminNavKeyboard() });
+}
+
+function sendCancelOptions(chatId, userId) {
+  const data = readBookings();
+  const myBookings = data.bookings
+    .filter((b) => b.userId === userId && (b.status === "pending" || b.status === "approved"))
+    .sort((a, b) => (a.datetime > b.datetime ? 1 : -1));
+  if (myBookings.length === 0) return bot.sendMessage(chatId, "У вас нет активных броней для отмены.", { reply_markup: userNavKeyboard() });
+  const rows = myBookings.map((b) => [{ text: `#${b.id} ${b.room} ${formatDateTime(b.datetime)}`, callback_data: `cancel:${b.id}` }]);
+  rows.push([
+    { text: "⬅ Назад", callback_data: "menu" },
+    { text: "🏠 Главное меню", callback_data: "menu" },
+  ]);
+  bot.sendMessage(chatId, "Выберите бронь для отмены:", { reply_markup: { inline_keyboard: rows } });
+}
+
+function sendAdminPending(chatId) {
+  const data = readBookings();
+  const pending = data.bookings.filter((b) => b.status === "pending").sort((a, b) => (a.datetime > b.datetime ? 1 : -1));
+  if (pending.length === 0) return bot.sendMessage(chatId, "Нет заявок на подтверждение.", { reply_markup: adminNavKeyboard() });
+  for (const b of pending) {
+    const text = [
+      `ID: ${b.id}`,
+      `Пользователь: ${formatUserTag(b.username)} (ID: ${b.userId})`,
+      `ФИО: ${b.fullName || "-"}`,
+      `Телефон: ${b.phone || "-"}`,
+      `Помещение: ${b.room}`,
+      `Время: ${formatRange(b.datetime, b.durationMinutes)}`,
+      `Цель: ${b.purpose}`,
+    ].join("\n");
+    bot.sendMessage(chatId, text, {
+      reply_markup: {
+        inline_keyboard: [[
+          { text: "✅ Подтвердить", callback_data: `approve:${b.id}` },
+          { text: "❌ Отклонить", callback_data: `reject:${b.id}` },
+        ], ...adminNavKeyboard().inline_keyboard],
+      },
+    });
+  }
+}
+
+function sendAdminDeleteOptions(chatId) {
+  const data = readBookings();
+  const activeBookings = data.bookings
+    .filter((b) => b.status === "pending" || (b.status === "approved" && !isBookingFinished(b)))
+    .sort((a, b) => (a.datetime > b.datetime ? 1 : -1));
+  if (activeBookings.length === 0) {
+    bot.sendMessage(chatId, "Нет броней для удаления.", { reply_markup: adminNavKeyboard() });
+    return;
+  }
+  const rows = activeBookings.map((b) => [
+    {
+      text: `#${b.id} ${b.room} ${formatDateTime(b.datetime)} (${b.username})`,
+      callback_data: `admin_cancel:${b.id}`,
+    },
+  ]);
+  rows.push(...adminNavKeyboard().inline_keyboard);
+  bot.sendMessage(chatId, "Выберите бронь для удаления:", {
+    reply_markup: { inline_keyboard: rows },
+  });
+}
+
+function sendFreeNow(chatId) {
+  const now = new Date();
+  const items = ROOM_OPTIONS.map((room) => {
+    const active = getActiveBookingForRoom(room, now);
+    if (!active) {
+      return `🟢 ${room}: свободно`;
+    }
+    const end = new Date(parseDateTime(active.datetime).getTime() + (active.durationMinutes || 60) * 60000);
+    return `🔴 ${room}: занято до ${toHHMM(end)} (${active.purpose || "мероприятие"})`;
+  });
+
+  const text = [`Статус залов на сейчас (${formatLogDate(now.toISOString())}):`, "", ...items].join("\n");
+  bot.sendMessage(chatId, text, { reply_markup: userNavKeyboard() });
+}
+
+function sendWeeklyLoad(chatId) {
+  const data = readBookings();
+  const now = Date.now();
+  const weekAgo = now - 7 * 24 * 60 * 60 * 1000;
+  const approved = data.bookings.filter((b) => b.status === "approved");
+
+  const totals = ROOM_OPTIONS.map((room) => ({ room, minutes: 0, bookings: 0 }));
+  for (const b of approved) {
+    const start = parseDateTime(b.datetime).getTime();
+    if (start < weekAgo || start > now) continue;
+    const item = totals.find((x) => x.room === b.room);
+    if (!item) continue;
+    item.minutes += b.durationMinutes || 60;
+    item.bookings += 1;
+  }
+
+  const sorted = totals.sort((a, b) => b.minutes - a.minutes);
+  const totalMinutesAll = sorted.reduce((acc, x) => acc + x.minutes, 0);
+  const lines = sorted.map((x, i) => {
+    const share = totalMinutesAll > 0 ? Math.round((x.minutes / totalMinutesAll) * 100) : 0;
+    return `${i + 1}) ${x.room}\n   Броней: ${x.bookings}\n   Занято: ${x.minutes} мин (${share}%)`;
+  });
+
+  const text =
+    totalMinutesAll === 0
+      ? "За последние 7 дней подтвержденных броней нет."
+      : `📊 Рейтинг загрузки залов за последние 7 дней:\n\n${lines.join("\n\n")}`;
+  bot.sendMessage(chatId, text, { reply_markup: userNavKeyboard() });
+}
+
+function getActiveBookingForRoom(room, date) {
+  const data = readBookings();
+  const nowMs = date.getTime();
+  const approved = data.bookings.filter((b) => b.status === "approved" && b.room === room);
+  for (const b of approved) {
+    const start = parseDateTime(b.datetime).getTime();
+    const end = start + (b.durationMinutes || 60) * 60000;
+    if (nowMs >= start && nowMs < end) {
+      return b;
+    }
+  }
+  return null;
+}
+
+function sendAdminHistory(chatId) {
+  const data = readBookings();
+  const logs = (data.actionLog || []).slice(0, 30);
+  if (logs.length === 0) {
+    bot.sendMessage(chatId, "История действий пока пуста.", { reply_markup: adminNavKeyboard() });
+    return;
+  }
+  const text = logs
+    .map((entry, i) => {
+      const actionLabel =
+        entry.action === "approved" ? "подтвердил" : entry.action === "rejected" ? "отклонил" : "отменил";
+      return `${i + 1}) ${formatLogDate(entry.at)}
+Админ: ${entry.adminTag} (ID: ${entry.adminId})
+Действие: ${actionLabel} бронь #${entry.bookingId}
+Помещение: ${entry.room}
+Время: ${formatRange(entry.datetime, entry.durationMinutes)}
+Пользователь: ${entry.userTag} (ID: ${entry.userId})`;
+    })
+    .join("\n\n");
+  bot.sendMessage(chatId, `📜 История действий админов:\n\n${text}`, { reply_markup: adminNavKeyboard() });
+}
+
+function formatDate(date) {
+  return `${date.getFullYear()}-${`${date.getMonth() + 1}`.padStart(2, "0")}-${`${date.getDate()}`.padStart(2, "0")}`;
+}
+
+function isBookingFinished(booking) {
+  const start = parseDateTime(booking.datetime).getTime();
+  const end = start + (booking.durationMinutes || 60) * 60000;
+  return end <= Date.now();
+}
+
+function startOfDay(date) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+function isValidPhone(phone) {
+  return /^\+?[0-9()\-\s]{10,20}$/.test(phone);
+}
+
+function formatUserTag(username) {
+  if (!username) return "-";
+  return username.startsWith("@") ? username : `@${username}`;
+}
+
+function bookingTextControls() {
+  return {
+    inline_keyboard: [
+      [
+        { text: "⬅ Назад", callback_data: "book_back" },
+        { text: "🏠 В меню", callback_data: "menu" },
+      ],
+    ],
+  };
+}
+
+function confirmInlineKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: "✅ Да, все верно", callback_data: "book_submit_yes" },
+        { text: "❌ Нет, заполнить заново", callback_data: "book_submit_no" },
+      ],
+      [{ text: "⬅ Назад", callback_data: "book_back" }],
+    ],
+  };
+}
+
+function buildBookingPreview(data) {
+  return [
+    "Проверьте заявку:",
+    `Помещение: ${data.room}`,
+    `Время: ${formatRange(data.datetime, data.durationMinutes)}`,
+    `ФИО: ${data.fullName}`,
+    `Телефон: ${data.phone}`,
+    `Цель: ${data.purpose}`,
+    "",
+    "Все введено правильно?",
+  ].join("\n");
+}
+
+function addAdminActionLog(action, booking, adminUser) {
+  const data = readBookings();
+  if (!Array.isArray(data.actionLog)) data.actionLog = [];
+  data.actionLog.unshift({
+    at: new Date().toISOString(),
+    action,
+    bookingId: booking.id,
+    room: booking.room,
+    datetime: booking.datetime,
+    durationMinutes: booking.durationMinutes || 60,
+    userId: booking.userId,
+    userTag: formatUserTag(booking.username),
+    adminId: adminUser.id,
+    adminTag: formatUserTag(adminUser.username || adminUser.first_name || "admin"),
+  });
+  if (data.actionLog.length > 500) data.actionLog = data.actionLog.slice(0, 500);
+  writeBookings(data);
+}
+
+function formatLogDate(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const yyyy = d.getFullYear();
+  const mm = `${d.getMonth() + 1}`.padStart(2, "0");
+  const dd = `${d.getDate()}`.padStart(2, "0");
+  const hh = `${d.getHours()}`.padStart(2, "0");
+  const min = `${d.getMinutes()}`.padStart(2, "0");
+  return `${yyyy}-${mm}-${dd} ${hh}:${min}`;
+}
+
+function getHelpText(userId) {
+  if (isAdmin(userId)) {
+    return `${HELP_TEXT_BASE}\n/admin — админ-панель`;
+  }
+  return HELP_TEXT_BASE;
+}
+
+function userNavKeyboard() {
+  return {
+    inline_keyboard: [[
+      { text: "⬅ Назад", callback_data: "menu" },
+      { text: "🏠 Главное меню", callback_data: "menu" },
+    ]],
+  };
+}
+
+
+function adminNavKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: "⬅ Назад в админ-панель", callback_data: "admin_menu" }],
+      [{ text: "🏠 Главное меню", callback_data: "menu" }],
+    ],
+  };
+}

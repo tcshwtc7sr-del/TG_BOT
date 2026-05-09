@@ -1,0 +1,13 @@
+{
+  "name": "room-booking-bot",
+  "version": "1.0.0",
+  "private": true,
+  "main": "telegram-bot/index.js",
+  "scripts": {
+    "bot:start": "node telegram-bot/index.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "node-telegram-bot-api": "^0.66.0"
+  }
+}

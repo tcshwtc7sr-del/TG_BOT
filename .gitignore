@@ -1,0 +1,5 @@
+node_modules/
+.env
+.DS_Store
+# Локальные брони не в репозиторий (на сервере — DATA_DIR=/data)
+telegram-bot/data/bookings.json

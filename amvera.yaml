@@ -1,0 +1,9 @@
+meta:
+  environment: node
+  toolchain:
+    name: npm
+    version: 20
+
+run:
+  command: npm run bot:start
+  persistenceMount: /data
