@@ -206,7 +206,7 @@ bot.on("callback_query", async (query) => {
     if (prev) await deleteBookingFlowMessage(prev);
     activeStates.set(userId, {
       step: "pick_room",
-      data: { userId, username: query.from.username || query.from.first_name || "unknown" },
+      data: { userId, ...userBookingFields(query.from) },
       flowMessageId: null,
       flowChatId: null,
     });
@@ -403,12 +403,11 @@ bot.on("callback_query", async (query) => {
 
   if (data === "book_submit_no") {
     const state = activeStates.get(userId);
-    const username = state?.data?.username || query.from.username || query.from.first_name || "unknown";
     const flowMessageId = state?.flowMessageId;
     const flowChatId = state?.flowChatId;
     activeStates.set(userId, {
       step: "pick_room",
-      data: { userId, username },
+      data: { userId, ...userBookingFields(query.from) },
       flowMessageId,
       flowChatId,
     });
@@ -594,12 +593,22 @@ function writeBookings(data) {
   fs.writeFileSync(BOOKINGS_FILE, JSON.stringify(data, null, 2));
 }
 
+function userBookingFields(from) {
+  const telegramUsername = from.username ? String(from.username).replace(/^@/, "") : null;
+  const userChatName =
+    [from.first_name, from.last_name].filter(Boolean).join(" ").trim() || null;
+  return { telegramUsername, userChatName };
+}
+
 function addBooking(input) {
   const data = readBookings();
   const booking = {
     id: data.nextId++,
     userId: input.userId,
-    username: input.username,
+    telegramUsername: input.telegramUsername || null,
+    userChatName: input.userChatName || null,
+    /** устар.: для старых записей и запасного отображения */
+    username: input.telegramUsername || input.userChatName || "unknown",
     room: input.room,
     datetime: input.datetime,
     durationMinutes: input.durationMinutes,
@@ -686,7 +695,7 @@ async function notifyAdminsForApproval(booking) {
       [
         "🔔 Новая заявка",
         `ID: ${booking.id}`,
-        `Пользователь: ${booking.username}`,
+        `Пользователь: ${formatUserTag(booking)}`,
         `ФИО: ${booking.fullName}`,
         `Телефон: ${booking.phone}`,
         `Помещение: ${formatRoomForDisplay(booking.room)}`,
@@ -707,7 +716,7 @@ async function notifyAdminsForApproval(booking) {
 
 async function notifyAdminsCancelled(booking) {
   for (const adminId of ADMIN_USER_IDS) {
-    await bot.sendMessage(adminId, `Пользователь ${booking.username} отменил бронь #${booking.id}.`);
+    await bot.sendMessage(adminId, `Пользователь ${formatUserTag(booking)} отменил бронь #${booking.id}.`);
   }
 }
 
@@ -1078,9 +1087,7 @@ function sendAdminSchedule(chatId) {
   const text = sorted
     .map(
       (b) =>
-        `#${b.id} | ${formatRange(b.datetime, b.durationMinutes)} | ${formatRoomForDisplay(b.room)}\nЮзер: ${formatUserTag(
-          b.username
-        )} (ID: ${b.userId})\nФИО: ${b.fullName || "-"} | Тел: ${b.phone || "-"}`
+        `#${b.id} | ${formatRange(b.datetime, b.durationMinutes)} | ${formatRoomForDisplay(b.room)}\nЮзер: ${formatUserTag(b)} (ID: ${b.userId})\nФИО: ${b.fullName || "-"} | Тел: ${b.phone || "-"}`
     )
     .join("\n\n");
   bot.sendMessage(chatId, `🗓 Подтвержденное расписание (админ):\n\n${text}`, { reply_markup: adminNavKeyboard() });
@@ -1099,9 +1106,7 @@ function sendAdminArchive(chatId) {
     .slice(0, 50)
     .map(
       (b) =>
-        `#${b.id} | ${formatRange(b.datetime, b.durationMinutes)} | ${formatRoomForDisplay(b.room)}\nЮзер: ${formatUserTag(
-          b.username
-        )} (ID: ${b.userId})\nФИО: ${b.fullName || "-"} | Тел: ${b.phone || "-"}`
+        `#${b.id} | ${formatRange(b.datetime, b.durationMinutes)} | ${formatRoomForDisplay(b.room)}\nЮзер: ${formatUserTag(b)} (ID: ${b.userId})\nФИО: ${b.fullName || "-"} | Тел: ${b.phone || "-"}`
     )
     .join("\n\n");
   bot.sendMessage(chatId, `🗂 Архив завершенных броней:\n\n${text}`, { reply_markup: adminNavKeyboard() });
@@ -1130,7 +1135,7 @@ function sendAdminPending(chatId) {
   for (const b of pending) {
     const text = [
       `ID: ${b.id}`,
-      `Пользователь: ${formatUserTag(b.username)} (ID: ${b.userId})`,
+      `Пользователь: ${formatUserTag(b)} (ID: ${b.userId})`,
       `ФИО: ${b.fullName || "-"}`,
       `Телефон: ${b.phone || "-"}`,
       `Помещение: ${formatRoomForDisplay(b.room)}`,
@@ -1159,7 +1164,7 @@ function sendAdminDeleteOptions(chatId) {
   }
   const rows = activeBookings.map((b) => [
     {
-      text: `#${b.id} ${b.room} ${formatDateTime(b.datetime)} (${b.username})`,
+      text: `#${b.id} ${b.room} ${formatDateTime(b.datetime)} (${formatUserTag(b)})`,
       callback_data: `admin_cancel:${b.id}`,
     },
   ]);
@@ -1268,9 +1273,32 @@ function isValidPhone(phone) {
   return /^\+?[0-9()\-\s]{10,20}$/.test(phone);
 }
 
-function formatUserTag(username) {
-  if (!username) return "-";
-  return username.startsWith("@") ? username : `@${username}`;
+/** Бронь — объект; иначе строка (лог, админ). @ только у реального Telegram username. */
+function formatUserTag(subject) {
+  if (subject == null) return "-";
+  if (typeof subject === "object" && subject !== null && "userId" in subject) {
+    return formatBookingUserLabel(subject);
+  }
+  return formatPlainTelegramHandleOrName(String(subject));
+}
+
+function formatBookingUserLabel(b) {
+  if (b.telegramUsername) return `@${String(b.telegramUsername).replace(/^@/, "")}`;
+  if (b.userChatName && String(b.userChatName).trim()) return String(b.userChatName).trim();
+  return formatPlainTelegramHandleOrName(b.username);
+}
+
+/** Латинский ник Telegram 5–32 символа; иначе считаем именем/подписью без @ */
+function looksLikeTelegramUsername(s) {
+  return /^[a-zA-Z][a-zA-Z0-9_]{4,31}$/.test(s);
+}
+
+function formatPlainTelegramHandleOrName(raw) {
+  if (!raw || raw === "unknown") return "-";
+  const s = String(raw).trim();
+  if (s.startsWith("@")) return s;
+  if (looksLikeTelegramUsername(s)) return `@${s}`;
+  return s;
 }
 
 function bookingTextControls() {
@@ -1320,7 +1348,7 @@ function addAdminActionLog(action, booking, adminUser) {
     datetime: booking.datetime,
     durationMinutes: booking.durationMinutes || 60,
     userId: booking.userId,
-    userTag: formatUserTag(booking.username),
+    userTag: formatUserTag(booking),
     adminId: adminUser.id,
     adminTag: formatUserTag(adminUser.username || adminUser.first_name || "admin"),
   });
