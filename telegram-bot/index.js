@@ -1,4 +1,5 @@
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const TelegramBot = require("node-telegram-bot-api");
 require("dotenv").config();
@@ -481,6 +482,17 @@ bot.on("callback_query", async (query) => {
     return answer(query.id);
   }
 
+  if (data === "admin_export_csv") {
+    if (!isAdmin(userId)) return answer(query.id, "Только для админа.");
+    try {
+      await sendBookingsCsvExport(chatId);
+    } catch (e) {
+      console.error("admin_export_csv:", e?.message || e);
+      bot.sendMessage(chatId, "Не удалось сформировать файл. Попробуйте позже.");
+    }
+    return answer(query.id, "Готово");
+  }
+
   if (data === "admin_delete_pick") {
     if (!isAdmin(userId)) return answer(query.id, "Только для админа.");
     sendAdminDeleteOptions(chatId);
@@ -591,6 +603,84 @@ function readBookings() {
 
 function writeBookings(data) {
   fs.writeFileSync(BOOKINGS_FILE, JSON.stringify(data, null, 2));
+}
+
+function csvCellSemicolon(value) {
+  const s = value == null ? "" : String(value);
+  if (/[;\n\r"]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+function formatExportFileTimestamp() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}`;
+}
+
+/** UTF-8 с BOM, разделитель «;» — в русском Excel обычно открывается в столбцы без лишних настроек */
+function buildBookingsCsv() {
+  const data = readBookings();
+  const headers = [
+    "id",
+    "status",
+    "room_key",
+    "room_title",
+    "datetime",
+    "duration_minutes",
+    "full_name",
+    "phone",
+    "purpose",
+    "user_id",
+    "user_display",
+    "telegram_username",
+    "user_chat_name",
+    "username_legacy",
+    "created_at",
+    "reviewed_at",
+  ];
+  const lines = [headers.join(";")];
+  const sorted = [...(data.bookings || [])].sort((a, b) => (a.id < b.id ? 1 : -1));
+  for (const b of sorted) {
+    lines.push(
+      [
+        b.id,
+        b.status || "",
+        b.room || "",
+        formatRoomForDisplay(b.room || ""),
+        b.datetime || "",
+        b.durationMinutes ?? "",
+        b.fullName || "",
+        b.phone || "",
+        b.purpose || "",
+        b.userId ?? "",
+        formatUserTag(b),
+        b.telegramUsername ?? "",
+        b.userChatName ?? "",
+        b.username ?? "",
+        b.createdAt ?? "",
+        b.reviewedAt ?? "",
+      ]
+        .map(csvCellSemicolon)
+        .join(";")
+    );
+  }
+  return `\uFEFF${lines.join("\n")}`;
+}
+
+async function sendBookingsCsvExport(chatId) {
+  const data = readBookings();
+  const n = (data.bookings || []).length;
+  const csv = buildBookingsCsv();
+  const fname = `bron_export_${formatExportFileTimestamp()}.csv`;
+  const tmp = path.join(os.tmpdir(), fname);
+  fs.writeFileSync(tmp, csv, "utf8");
+  try {
+    await bot.sendDocument(chatId, tmp, {
+      caption: `Брони: ${n} строк. Разделитель «;», кодировка UTF-8. В Excel: «Данные» → «Из текстового/CSV-файла» или двойной щелчок по файлу.`,
+    });
+  } finally {
+    fs.unlink(tmp, () => {});
+  }
 }
 
 function userBookingFields(from) {
@@ -908,6 +998,7 @@ function sendAdminMenu(chatId) {
         [{ text: "🗂 Архив завершенных броней", callback_data: "admin_archive" }],
         [{ text: "🗑 Удалить бронь пользователя", callback_data: "admin_delete_pick" }],
         [{ text: "📜 История действий", callback_data: "admin_history" }],
+        [{ text: "📥 Таблица Excel (CSV)", callback_data: "admin_export_csv" }],
         [{ text: "🏠 В главное меню", callback_data: "menu" }],
       ],
     },
@@ -1375,7 +1466,7 @@ function formatLogDate(iso) {
 
 function getHelpText(userId) {
   if (isAdmin(userId)) {
-    return `${HELP_TEXT_BASE}\n/admin — админ-панель`;
+    return `${HELP_TEXT_BASE}\n/admin — админ-панель (внутри: выгрузка броней в CSV)`;
   }
   return HELP_TEXT_BASE;
 }
