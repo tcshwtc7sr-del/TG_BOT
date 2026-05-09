@@ -621,22 +621,22 @@ function formatExportFileTimestamp() {
 function buildBookingsCsv() {
   const data = readBookings();
   const headers = [
-    "id",
-    "status",
-    "room_key",
-    "room_title",
-    "datetime",
-    "duration_minutes",
-    "full_name",
-    "phone",
-    "purpose",
-    "user_id",
-    "user_display",
-    "telegram_username",
-    "user_chat_name",
-    "username_legacy",
-    "created_at",
-    "reviewed_at",
+    "ID заявки",
+    "Статус",
+    "Помещение (код в системе)",
+    "Помещение",
+    "Дата и время начала",
+    "Длительность, мин",
+    "ФИО заявителя",
+    "Телефон",
+    "Цель / мероприятие",
+    "Telegram ID заявителя",
+    "Заявитель (подпись в боте)",
+    "Username в Telegram",
+    "Имя из профиля Telegram",
+    "Поле username (устар.)",
+    "Создано",
+    "Обработано админом",
   ];
   const lines = [headers.join(";")];
   const sorted = [...(data.bookings || [])].sort((a, b) => (a.id < b.id ? 1 : -1));
@@ -644,7 +644,7 @@ function buildBookingsCsv() {
     lines.push(
       [
         b.id,
-        b.status || "",
+        statusLabel(b.status),
         b.room || "",
         formatRoomForDisplay(b.room || ""),
         b.datetime || "",
@@ -667,19 +667,71 @@ function buildBookingsCsv() {
   return `\uFEFF${lines.join("\n")}`;
 }
 
+function actionLogActionRu(action) {
+  if (action === "approved") return "Подтверждена";
+  if (action === "rejected") return "Отклонена";
+  if (action === "cancelled") return "Отменена админом";
+  return action || "";
+}
+
+function buildActionLogCsv() {
+  const data = readBookings();
+  const headers = [
+    "Дата и время действия",
+    "Действие",
+    "ID брони",
+    "Помещение (код в системе)",
+    "Помещение",
+    "Дата и время начала брони",
+    "Длительность, мин",
+    "Telegram ID заявителя",
+    "Заявитель",
+    "Telegram ID админа",
+    "Администратор",
+  ];
+  const lines = [headers.join(";")];
+  const logs = [...(data.actionLog || [])].sort((a, b) => (a.at < b.at ? 1 : -1));
+  for (const e of logs) {
+    lines.push(
+      [
+        e.at || "",
+        actionLogActionRu(e.action),
+        e.bookingId ?? "",
+        e.room || "",
+        formatRoomForDisplay(e.room || ""),
+        e.datetime || "",
+        e.durationMinutes ?? "",
+        e.userId ?? "",
+        e.userTag || "",
+        e.adminId ?? "",
+        e.adminTag || "",
+      ]
+        .map(csvCellSemicolon)
+        .join(";")
+    );
+  }
+  return `\uFEFF${lines.join("\n")}`;
+}
+
 async function sendBookingsCsvExport(chatId) {
   const data = readBookings();
   const n = (data.bookings || []).length;
-  const csv = buildBookingsCsv();
-  const fname = `bron_export_${formatExportFileTimestamp()}.csv`;
-  const tmp = path.join(os.tmpdir(), fname);
-  fs.writeFileSync(tmp, csv, "utf8");
+  const m = (data.actionLog || []).length;
+  const stamp = formatExportFileTimestamp();
+  const tmpBookings = path.join(os.tmpdir(), `broni_${stamp}.csv`);
+  const tmpLog = path.join(os.tmpdir(), `istoriya_admina_${stamp}.csv`);
+  fs.writeFileSync(tmpBookings, buildBookingsCsv(), "utf8");
+  fs.writeFileSync(tmpLog, buildActionLogCsv(), "utf8");
   try {
-    await bot.sendDocument(chatId, tmp, {
-      caption: `Брони: ${n} строк. Разделитель «;», кодировка UTF-8. В Excel: «Данные» → «Из текстового/CSV-файла» или двойной щелчок по файлу.`,
+    await bot.sendDocument(chatId, tmpBookings, {
+      caption: `Файл 1 из 2: все брони (${n} строк). Заголовки на русском. Разделитель «;», UTF-8.`,
+    });
+    await bot.sendDocument(chatId, tmpLog, {
+      caption: `Файл 2 из 2: история действий админов (${m} строк). Тот же формат.`,
     });
   } finally {
-    fs.unlink(tmp, () => {});
+    fs.unlink(tmpBookings, () => {});
+    fs.unlink(tmpLog, () => {});
   }
 }
 
