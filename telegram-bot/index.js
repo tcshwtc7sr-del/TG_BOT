@@ -1087,7 +1087,7 @@ function sendAdminSchedule(chatId) {
   const text = sorted
     .map(
       (b) =>
-        `#${b.id} | ${formatRange(b.datetime, b.durationMinutes)} | ${formatRoomForDisplay(b.room)}\nЮзер: ${formatUserTag(b)} (ID: ${b.userId})\nФИО: ${b.fullName || "-"} | Тел: ${b.phone || "-"}`
+        `#${b.id} | ${formatRange(b.datetime, b.durationMinutes)} | ${formatRoomForDisplay(b.room)}\nЮзер: ${formatUserTag(b)} (ID: ${b.userId})\nФИО: ${b.fullName || "-"} | Тел: ${b.phone || "-"}\n🎯 Мероприятие: ${b.purpose || "-"}`
     )
     .join("\n\n");
   bot.sendMessage(chatId, `🗓 Подтвержденное расписание (админ):\n\n${text}`, { reply_markup: adminNavKeyboard() });
@@ -1106,7 +1106,7 @@ function sendAdminArchive(chatId) {
     .slice(0, 50)
     .map(
       (b) =>
-        `#${b.id} | ${formatRange(b.datetime, b.durationMinutes)} | ${formatRoomForDisplay(b.room)}\nЮзер: ${formatUserTag(b)} (ID: ${b.userId})\nФИО: ${b.fullName || "-"} | Тел: ${b.phone || "-"}`
+        `#${b.id} | ${formatRange(b.datetime, b.durationMinutes)} | ${formatRoomForDisplay(b.room)}\nЮзер: ${formatUserTag(b)} (ID: ${b.userId})\nФИО: ${b.fullName || "-"} | Тел: ${b.phone || "-"}\n🎯 Мероприятие: ${b.purpose || "-"}`
     )
     .join("\n\n");
   bot.sendMessage(chatId, `🗂 Архив завершенных броней:\n\n${text}`, { reply_markup: adminNavKeyboard() });
@@ -1285,7 +1285,13 @@ function formatUserTag(subject) {
 function formatBookingUserLabel(b) {
   if (b.telegramUsername) return `@${String(b.telegramUsername).replace(/^@/, "")}`;
   if (b.userChatName && String(b.userChatName).trim()) return String(b.userChatName).trim();
-  return formatPlainTelegramHandleOrName(b.username);
+  // Старые брони: в username могло быть имя без @ в Telegram — не превращаем в @username
+  return legacyBookingDisplayName(b.username);
+}
+
+function legacyBookingDisplayName(raw) {
+  if (!raw || raw === "unknown") return "-";
+  return String(raw).trim();
 }
 
 /** Латинский ник Telegram 5–32 символа; иначе считаем именем/подписью без @ */
