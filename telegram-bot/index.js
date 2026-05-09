@@ -10,8 +10,8 @@ const ADMIN_USER_IDS = (process.env.ADMIN_USER_IDS || "")
   .split(",")
   .map((x) => Number(x.trim()))
   .filter((x) => !Number.isNaN(x));
-const WORK_START_HOUR = toHour(process.env.WORK_START_HOUR, 8);
-const WORK_END_HOUR = toHour(process.env.WORK_END_HOUR, 20);
+const WORK_START_HOUR = toHour(process.env.WORK_START_HOUR, 9);
+const WORK_END_HOUR = toHour(process.env.WORK_END_HOUR, 18);
 const REMINDER_MINUTES_BEFORE = toPositiveInt(process.env.REMINDER_MINUTES_BEFORE, 30);
 const PENDING_TTL_HOURS = toPositiveInt(process.env.PENDING_TTL_HOURS, 24);
 
@@ -20,7 +20,18 @@ const DATA_DIR = process.env.DATA_DIR
   ? path.resolve(process.env.DATA_DIR)
   : path.join(__dirname, "data");
 const BOOKINGS_FILE = path.join(DATA_DIR, "bookings.json");
+/** Короткие имена в данных и callback; на кнопках и в текстах — см. formatRoomForDisplay / roomButtonLabel */
 const ROOM_OPTIONS = ["Конференц-зал", "Общий-зал", "Актовый-зал"];
+const ROOM_BUTTON_LABEL = {
+  "Конференц-зал": "Конференц-зал (стекляшка) 👥25",
+  "Общий-зал": "Общий-зал 👥70",
+  "Актовый-зал": "Актовый-зал",
+};
+const ROOM_DISPLAY = {
+  "Конференц-зал": "Конференц-зал (стекляшка), до 25 человек 👥",
+  "Общий-зал": "Общий-зал, до 70 человек 👥",
+  "Актовый-зал": "Актовый-зал",
+};
 const WEEK_DAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
 const MONTHS_RU = [
   "Январь",
@@ -38,9 +49,12 @@ const MONTHS_RU = [
 ];
 const activeStates = new Map();
 
+const WORK_HOURS_TEXT = `${String(WORK_START_HOUR).padStart(2, "0")}:00–${String(WORK_END_HOUR).padStart(2, "0")}:00`;
+
 const HELP_TEXT_BASE = [
   "🏢 Бот бронирования помещения",
   "",
+  `⏰ Рабочее время организации: ${WORK_HOURS_TEXT} (слоты только в этом интервале).`,
   "• Выбор даты через календарь",
   "• Выбор времени удобными слотами",
   "• Заявки проходят согласование админа",
@@ -172,7 +186,11 @@ bot.on("callback_query", (query) => {
       step: "pick_room",
       data: { userId, username: query.from.username || query.from.first_name || "unknown" },
     });
-    bot.sendMessage(chatId, "1/5 Выберите помещение:", { reply_markup: roomInlineKeyboard() });
+    bot.sendMessage(
+      chatId,
+      "1/5 Выберите помещение (на кнопках — макс. число гостей 👥):",
+      { reply_markup: roomInlineKeyboard() }
+    );
     return answer(query.id);
   }
 
@@ -196,7 +214,7 @@ bot.on("callback_query", (query) => {
     }
     if (state.step === "pick_duration") {
       state.step = "pick_time";
-      bot.sendMessage(chatId, `3/5 Время для ${state.data.date}:`, {
+      bot.sendMessage(chatId, `3/5 Время для ${state.data.date} (${formatRoomForDisplay(state.data.room)}):`, {
         reply_markup: timeInlineKeyboard(state.data.date, state.data.room),
       });
       return answer(query.id);
@@ -211,7 +229,9 @@ bot.on("callback_query", (query) => {
     }
     if (state.step === "pick_date") {
       state.step = "pick_room";
-      bot.sendMessage(chatId, "1/5 Выберите помещение:", { reply_markup: roomInlineKeyboard() });
+      bot.sendMessage(chatId, "1/5 Выберите помещение (на кнопках — макс. число гостей 👥):", {
+        reply_markup: roomInlineKeyboard(),
+      });
       return answer(query.id);
     }
     return answer(query.id);
@@ -220,7 +240,9 @@ bot.on("callback_query", (query) => {
   if (data.startsWith("book_room:")) {
     const state = activeStates.get(userId);
     if (!state) return answer(query.id, "Начните заново через меню.");
-    state.data.room = data.replace("book_room:", "");
+    const room = data.replace("book_room:", "");
+    if (!ROOM_OPTIONS.includes(room)) return answer(query.id, "Неизвестное помещение.");
+    state.data.room = room;
     state.step = "pick_date";
     const today = new Date();
     bot.sendMessage(chatId, "2/5 Выберите дату:", {
@@ -253,7 +275,9 @@ bot.on("callback_query", (query) => {
     if (Number.isNaN(dayStart.getTime())) return answer(query.id, "Некорректная дата.");
     state.data.date = dateText;
     state.step = "pick_time";
-    bot.sendMessage(chatId, `3/5 Время для ${dateText}:`, { reply_markup: timeInlineKeyboard(dateText, state.data.room) });
+    bot.sendMessage(chatId, `3/5 Время для ${dateText} (${formatRoomForDisplay(state.data.room)}):`, {
+      reply_markup: timeInlineKeyboard(dateText, state.data.room),
+    });
     return answer(query.id);
   }
 
@@ -265,9 +289,13 @@ bot.on("callback_query", (query) => {
     if (isInPast(datetime)) return answer(query.id, "Это время уже прошло.");
     state.data.datetime = datetime;
     state.step = "pick_duration";
-    bot.sendMessage(chatId, `4/5 Длительность для ${formatDateTime(datetime)}:`, {
-      reply_markup: durationInlineKeyboard(state.data.room, datetime),
-    });
+    bot.sendMessage(
+      chatId,
+      `4/5 Длительность для ${formatDateTime(datetime)} (${formatRoomForDisplay(state.data.room)}). Окончание не позже ${WORK_HOURS_TEXT}:`,
+      {
+        reply_markup: durationInlineKeyboard(state.data.room, datetime),
+      }
+    );
     return answer(query.id);
   }
 
@@ -277,7 +305,7 @@ bot.on("callback_query", (query) => {
     const duration = Number(data.replace("book_duration:", ""));
     if (Number.isNaN(duration) || duration <= 0) return answer(query.id, "Некорректная длительность.");
     if (!isWithinWorkingHoursWithDuration(state.data.datetime, duration)) {
-      return answer(query.id, "Интервал выходит за рабочее время.");
+      return answer(query.id, `Интервал выходит за рабочее время организации (${WORK_HOURS_TEXT}).`);
     }
     state.data.durationMinutes = duration;
     state.step = "full_name";
@@ -301,7 +329,7 @@ bot.on("callback_query", (query) => {
       [
         "✅ Заявка отправлена администратору",
         `ID: ${booking.id}`,
-        `Помещение: ${booking.room}`,
+        `Помещение: ${formatRoomForDisplay(booking.room)}`,
         `Время: ${formatRange(booking.datetime, booking.durationMinutes)}`,
         `ФИО: ${booking.fullName}`,
         `Телефон: ${booking.phone}`,
@@ -320,7 +348,7 @@ bot.on("callback_query", (query) => {
       step: "pick_room",
       data: { userId, username },
     });
-    bot.sendMessage(chatId, "Окей, заполним заново.\n1/5 Выберите помещение:", {
+    bot.sendMessage(chatId, "Окей, заполним заново.\n1/5 Выберите помещение (на кнопках — макс. число гостей 👥):", {
       reply_markup: roomInlineKeyboard(),
     });
     return answer(query.id);
@@ -593,7 +621,7 @@ async function notifyAdminsForApproval(booking) {
         `Пользователь: ${booking.username}`,
         `ФИО: ${booking.fullName}`,
         `Телефон: ${booking.phone}`,
-        `Помещение: ${booking.room}`,
+        `Помещение: ${formatRoomForDisplay(booking.room)}`,
         `Время: ${formatRange(booking.datetime, booking.durationMinutes)}`,
         `Цель: ${booking.purpose}`,
       ].join("\n"),
@@ -618,7 +646,7 @@ async function notifyAdminsCancelled(booking) {
 async function notifyUserBookingCancelledByAdmin(booking) {
   const text = [
     `❌ Ваша бронь #${booking.id} была отменена администратором.`,
-    `${booking.room} | ${formatRange(booking.datetime, booking.durationMinutes)}`,
+    `${formatRoomForDisplay(booking.room)} | ${formatRange(booking.datetime, booking.durationMinutes)}`,
   ].join("\n");
   await bot.sendMessage(booking.userId, text);
 }
@@ -626,14 +654,14 @@ async function notifyUserBookingCancelledByAdmin(booking) {
 async function notifyUserBookingStatus(booking, status) {
   let text;
   if (status === "approved") {
-    text = `✅ Ваша бронь #${booking.id} подтверждена.\n${booking.room} | ${formatRange(booking.datetime, booking.durationMinutes)}`;
+    text = `✅ Ваша бронь #${booking.id} подтверждена.\n${formatRoomForDisplay(booking.room)} | ${formatRange(booking.datetime, booking.durationMinutes)}`;
   } else if (status === "rejected_auto_conflict") {
-    text = `❌ Ваша заявка #${booking.id} отклонена автоматически, потому что пересекается с уже подтвержденной бронью.\n${booking.room} | ${formatRange(
+    text = `❌ Ваша заявка #${booking.id} отклонена автоматически, потому что пересекается с уже подтвержденной бронью.\n${formatRoomForDisplay(booking.room)} | ${formatRange(
       booking.datetime,
       booking.durationMinutes
     )}`;
   } else {
-    text = `❌ Ваша бронь #${booking.id} отклонена.\n${booking.room} | ${formatRange(booking.datetime, booking.durationMinutes)}`;
+    text = `❌ Ваша бронь #${booking.id} отклонена.\n${formatRoomForDisplay(booking.room)} | ${formatRange(booking.datetime, booking.durationMinutes)}`;
   }
   await bot.sendMessage(booking.userId, text);
 }
@@ -649,7 +677,7 @@ async function sendUpcomingReminders() {
     if (diffMs <= REMINDER_MINUTES_BEFORE * 60000 && diffMs > 0) {
       await bot.sendMessage(
         booking.userId,
-        `⏰ Напоминание: через ${REMINDER_MINUTES_BEFORE} мин начинается бронь #${booking.id} (${booking.room}, ${formatRange(
+        `⏰ Напоминание: через ${REMINDER_MINUTES_BEFORE} мин начинается бронь #${booking.id} (${formatRoomForDisplay(booking.room)}, ${formatRange(
           booking.datetime,
           booking.durationMinutes
         )}).`
@@ -720,6 +748,14 @@ function isAdmin(userId) {
   return ADMIN_USER_IDS.includes(userId);
 }
 
+function formatRoomForDisplay(storedRoom) {
+  return ROOM_DISPLAY[storedRoom] || storedRoom;
+}
+
+function roomButtonLabel(storedRoom) {
+  return ROOM_BUTTON_LABEL[storedRoom] || storedRoom;
+}
+
 function toHour(input, fallback) {
   const value = Number(input);
   if (Number.isNaN(value) || value < 0 || value > 23) return fallback;
@@ -775,7 +811,9 @@ function sendAdminMenu(chatId) {
 }
 
 function roomInlineKeyboard() {
-  const rows = ROOM_OPTIONS.map((room) => [{ text: room, callback_data: `book_room:${room}` }]);
+  const rows = ROOM_OPTIONS.map((room) => [
+    { text: roomButtonLabel(room), callback_data: `book_room:${room}` },
+  ]);
   rows.push([{ text: "🏠 В меню", callback_data: "menu" }]);
   return { inline_keyboard: rows };
 }
@@ -897,7 +935,7 @@ function sendMyBookings(chatId, userId) {
     .sort((a, b) => (a.datetime > b.datetime ? 1 : -1))
     .map(
       (b, i) =>
-        `${i + 1}) 📅 ${formatRange(b.datetime, b.durationMinutes)}\n🏢 Помещение: ${b.room}\n🎯 Мероприятие: ${
+        `${i + 1}) 📅 ${formatRange(b.datetime, b.durationMinutes)}\n🏢 Помещение: ${formatRoomForDisplay(b.room)}\n🎯 Мероприятие: ${
           b.purpose
         }\n📌 Статус: ${statusLabel(b.status)}`
     )
@@ -913,7 +951,7 @@ function sendMyPending(chatId, userId) {
     .sort((a, b) => (a.datetime > b.datetime ? 1 : -1))
     .map(
       (b, i) =>
-        `${i + 1}) 📅 ${formatRange(b.datetime, b.durationMinutes)}\n🏢 Помещение: ${b.room}\n🎯 Мероприятие: ${
+        `${i + 1}) 📅 ${formatRange(b.datetime, b.durationMinutes)}\n🏢 Помещение: ${formatRoomForDisplay(b.room)}\n🎯 Мероприятие: ${
           b.purpose
         }\n📌 Статус: ожидает подтверждения`
     )
@@ -930,7 +968,7 @@ function sendSchedule(chatId) {
   const text = sorted
     .map(
       (b, i) =>
-        `${i + 1}) 📅 ${formatRange(b.datetime, b.durationMinutes)}\n🏢 Помещение: ${b.room}\n🎯 Мероприятие: ${b.purpose || "-"}`
+        `${i + 1}) 📅 ${formatRange(b.datetime, b.durationMinutes)}\n🏢 Помещение: ${formatRoomForDisplay(b.room)}\n🎯 Мероприятие: ${b.purpose || "-"}`
     )
     .join("\n\n");
   bot.sendMessage(chatId, `🗓 Расписание бронирований:\n\n${text}`, { reply_markup: userNavKeyboard() });
@@ -945,7 +983,7 @@ function sendAdminSchedule(chatId) {
   const text = sorted
     .map(
       (b) =>
-        `#${b.id} | ${formatRange(b.datetime, b.durationMinutes)} | ${b.room}\nЮзер: ${formatUserTag(
+        `#${b.id} | ${formatRange(b.datetime, b.durationMinutes)} | ${formatRoomForDisplay(b.room)}\nЮзер: ${formatUserTag(
           b.username
         )} (ID: ${b.userId})\nФИО: ${b.fullName || "-"} | Тел: ${b.phone || "-"}`
     )
@@ -966,7 +1004,7 @@ function sendAdminArchive(chatId) {
     .slice(0, 50)
     .map(
       (b) =>
-        `#${b.id} | ${formatRange(b.datetime, b.durationMinutes)} | ${b.room}\nЮзер: ${formatUserTag(
+        `#${b.id} | ${formatRange(b.datetime, b.durationMinutes)} | ${formatRoomForDisplay(b.room)}\nЮзер: ${formatUserTag(
           b.username
         )} (ID: ${b.userId})\nФИО: ${b.fullName || "-"} | Тел: ${b.phone || "-"}`
     )
@@ -980,7 +1018,9 @@ function sendCancelOptions(chatId, userId) {
     .filter((b) => b.userId === userId && (b.status === "pending" || b.status === "approved"))
     .sort((a, b) => (a.datetime > b.datetime ? 1 : -1));
   if (myBookings.length === 0) return bot.sendMessage(chatId, "У вас нет активных броней для отмены.", { reply_markup: userNavKeyboard() });
-  const rows = myBookings.map((b) => [{ text: `#${b.id} ${b.room} ${formatDateTime(b.datetime)}`, callback_data: `cancel:${b.id}` }]);
+  const rows = myBookings.map((b) => [
+    { text: `#${b.id} ${roomButtonLabel(b.room)} ${formatDateTime(b.datetime)}`, callback_data: `cancel:${b.id}` },
+  ]);
   rows.push([
     { text: "⬅ Назад", callback_data: "menu" },
     { text: "🏠 Главное меню", callback_data: "menu" },
@@ -998,7 +1038,7 @@ function sendAdminPending(chatId) {
       `Пользователь: ${formatUserTag(b.username)} (ID: ${b.userId})`,
       `ФИО: ${b.fullName || "-"}`,
       `Телефон: ${b.phone || "-"}`,
-      `Помещение: ${b.room}`,
+      `Помещение: ${formatRoomForDisplay(b.room)}`,
       `Время: ${formatRange(b.datetime, b.durationMinutes)}`,
       `Цель: ${b.purpose}`,
     ].join("\n");
@@ -1039,10 +1079,10 @@ function sendFreeNow(chatId) {
   const items = ROOM_OPTIONS.map((room) => {
     const active = getActiveBookingForRoom(room, now);
     if (!active) {
-      return `🟢 ${room}: свободно`;
+      return `🟢 ${formatRoomForDisplay(room)}: свободно`;
     }
     const end = new Date(parseDateTime(active.datetime).getTime() + (active.durationMinutes || 60) * 60000);
-    return `🔴 ${room}: занято до ${toHHMM(end)} (${active.purpose || "мероприятие"})`;
+    return `🔴 ${formatRoomForDisplay(room)}: занято до ${toHHMM(end)} (${active.purpose || "мероприятие"})`;
   });
 
   const text = [`Статус залов на сейчас (${formatLogDate(now.toISOString())}):`, "", ...items].join("\n");
@@ -1069,7 +1109,7 @@ function sendWeeklyLoad(chatId) {
   const totalMinutesAll = sorted.reduce((acc, x) => acc + x.minutes, 0);
   const lines = sorted.map((x, i) => {
     const share = totalMinutesAll > 0 ? Math.round((x.minutes / totalMinutesAll) * 100) : 0;
-    return `${i + 1}) ${x.room}\n   Броней: ${x.bookings}\n   Занято: ${x.minutes} мин (${share}%)`;
+    return `${i + 1}) ${formatRoomForDisplay(x.room)}\n   Броней: ${x.bookings}\n   Занято: ${x.minutes} мин (${share}%)`;
   });
 
   const text =
@@ -1107,7 +1147,7 @@ function sendAdminHistory(chatId) {
       return `${i + 1}) ${formatLogDate(entry.at)}
 Админ: ${entry.adminTag} (ID: ${entry.adminId})
 Действие: ${actionLabel} бронь #${entry.bookingId}
-Помещение: ${entry.room}
+Помещение: ${formatRoomForDisplay(entry.room)}
 Время: ${formatRange(entry.datetime, entry.durationMinutes)}
 Пользователь: ${entry.userTag} (ID: ${entry.userId})`;
     })
@@ -1164,7 +1204,7 @@ function confirmInlineKeyboard() {
 function buildBookingPreview(data) {
   return [
     "Проверьте заявку:",
-    `Помещение: ${data.room}`,
+    `Помещение: ${formatRoomForDisplay(data.room)}`,
     `Время: ${formatRange(data.datetime, data.durationMinutes)}`,
     `ФИО: ${data.fullName}`,
     `Телефон: ${data.phone}`,
