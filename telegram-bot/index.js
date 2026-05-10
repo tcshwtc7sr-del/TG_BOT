@@ -1628,15 +1628,17 @@ function addAdminActionLog(action, booking, adminUser) {
   writeBookings(data);
 }
 
+/** Момент события (ISO UTC в логе) в «настенных часах» организации — как брони, не как часовой пояс сервера */
 function formatLogDate(iso) {
   const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  const yyyy = d.getFullYear();
-  const mm = `${d.getMonth() + 1}`.padStart(2, "0");
-  const dd = `${d.getDate()}`.padStart(2, "0");
-  const hh = `${d.getHours()}`.padStart(2, "0");
-  const min = `${d.getMinutes()}`.padStart(2, "0");
-  return `${yyyy}-${mm}-${dd} ${hh}:${min}`;
+  if (Number.isNaN(d.getTime())) return String(iso);
+  const datePart = new Intl.DateTimeFormat("en-CA", {
+    timeZone: BOOKING_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(d);
+  return `${datePart} ${toHHMM(d)}`;
 }
 
 function getHelpText(userId) {
