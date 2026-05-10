@@ -60,7 +60,7 @@ const HELP_TEXT_BASE = [
   "",
   `⏰ Рабочее время организации: ${WORK_HOURS_TEXT} (слоты только в этом интервале).`,
   "• Выбор даты через календарь",
-  "• Выбор времени удобными слотами",
+  "• Время начала и окончания шагом 30 минут",
   "• Заявки проходят согласование админа",
   "• Мастер бронирования обновляет одно сообщение (чат не забивается кнопками).",
   "",
@@ -107,7 +107,7 @@ bot.on("message", async (msg) => {
   }
 
   if (!["full_name", "phone", "purpose"].includes(state.step)) {
-    bot.sendMessage(chatId, "Используйте кнопки для выбора даты, времени и длительности.");
+    bot.sendMessage(chatId, "Используйте кнопки для выбора даты, времени начала и окончания.");
     return;
   }
 
@@ -247,12 +247,22 @@ bot.on("callback_query", async (query) => {
       await updateBookingFlowPanel(state, chatId, "7/7 Напишите цель бронирования одним сообщением:", bookingTextControls());
       return answer(query.id);
     }
-    if (state.step === "pick_duration") {
+    if (state.step === "full_name") {
+      state.step = "pick_end";
+      await updateBookingFlowPanel(
+        state,
+        chatId,
+        `4/5 Время окончания (начало ${formatDateTime(state.data.datetime)}, ${formatRoomForDisplay(state.data.room)}). Не позже ${WORK_HOURS_TEXT}:`,
+        endTimeInlineKeyboard(state.data.room, state.data.datetime)
+      );
+      return answer(query.id);
+    }
+    if (state.step === "pick_end") {
       state.step = "pick_time";
       await updateBookingFlowPanel(
         state,
         chatId,
-        `3/5 Время для ${state.data.date} (${formatRoomForDisplay(state.data.room)}):`,
+        `3/5 Время начала для ${state.data.date} (${formatRoomForDisplay(state.data.room)}):`,
         timeInlineKeyboard(state.data.date, state.data.room)
       );
       return answer(query.id);
@@ -346,23 +356,32 @@ bot.on("callback_query", async (query) => {
     const datetime = `${state.data.date} ${time}`;
     if (isInPast(datetime)) return answer(query.id, "Это время уже прошло.");
     state.data.datetime = datetime;
-    state.step = "pick_duration";
+    state.step = "pick_end";
     await updateBookingFlowPanel(
       state,
       chatId,
-      `4/5 Длительность для ${formatDateTime(datetime)} (${formatRoomForDisplay(state.data.room)}). Окончание не позже ${WORK_HOURS_TEXT}:`,
-      durationInlineKeyboard(state.data.room, datetime)
+      `4/5 Время окончания (начало ${formatDateTime(datetime)}, ${formatRoomForDisplay(state.data.room)}). Не позже ${WORK_HOURS_TEXT}:`,
+      endTimeInlineKeyboard(state.data.room, datetime)
     );
-    return answer(query.id, `Выбрано: ${time}`);
+    return answer(query.id, `Начало: ${time}`);
   }
 
-  if (data.startsWith("book_duration:")) {
+  if (data.startsWith("book_end:")) {
     const state = activeStates.get(userId);
-    if (!state || !state.data.datetime) return answer(query.id, "Сначала выберите дату и время.");
-    const duration = Number(data.replace("book_duration:", ""));
-    if (Number.isNaN(duration) || duration <= 0) return answer(query.id, "Некорректная длительность.");
+    if (!state || !state.data.datetime) return answer(query.id, "Сначала выберите время начала.");
+    const endHm = data.replace("book_end:", "");
+    const endDatetime = `${state.data.date} ${endHm}`;
+    const startMs = parseDateTime(state.data.datetime).getTime();
+    const endMs = parseDateTime(endDatetime).getTime();
+    if (Number.isNaN(startMs) || Number.isNaN(endMs)) return answer(query.id, "Некорректное время.");
+    if (endMs <= startMs) return answer(query.id, "Окончание должно быть позже начала.");
+    const duration = Math.round((endMs - startMs) / 60000);
+    if (duration < 30) return answer(query.id, "Минимум 30 минут.");
     if (!isWithinWorkingHoursWithDuration(state.data.datetime, duration)) {
       return answer(query.id, `Интервал выходит за рабочее время организации (${WORK_HOURS_TEXT}).`);
+    }
+    if (hasApprovedConflict(state.data.room, state.data.datetime, duration)) {
+      return answer(query.id, "На это время уже есть подтверждённая бронь.");
     }
     state.data.durationMinutes = duration;
     state.step = "full_name";
@@ -372,7 +391,7 @@ bot.on("callback_query", async (query) => {
       "5/8 Введите ваше ФИО одним сообщением (текст не будет дублироваться в чате):",
       bookingTextControls()
     );
-    return answer(query.id, `Выбрано: ${duration} мин`);
+    return answer(query.id, `До ${endHm}`);
   }
 
   if (data === "book_submit_yes") {
@@ -1155,6 +1174,20 @@ function calendarInlineKeyboard(year, month, selectedDate) {
   return { inline_keyboard: rows };
 }
 
+function hasAnyAvailableEndSlot(room, startDatetime) {
+  const datePart = startDatetime.split(" ")[0];
+  const startMs = parseDateTime(startDatetime).getTime();
+  if (Number.isNaN(startMs)) return false;
+  const closeMs = parseDateTime(`${datePart} ${String(WORK_END_HOUR).padStart(2, "0")}:00`).getTime();
+  if (Number.isNaN(closeMs)) return false;
+  for (let endMs = startMs + 30 * 60000; endMs <= closeMs; endMs += 30 * 60000) {
+    const duration = Math.round((endMs - startMs) / 60000);
+    if (!isWithinWorkingHoursWithDuration(startDatetime, duration)) continue;
+    if (!hasApprovedConflict(room, startDatetime, duration)) return true;
+  }
+  return false;
+}
+
 function timeInlineKeyboard(dateText, room) {
   const rows = [];
   const times = [];
@@ -1166,8 +1199,7 @@ function timeInlineKeyboard(dateText, room) {
   const available = times.filter((time) => {
     const datetime = `${dateText} ${time}`;
     if (isInPast(datetime)) return false;
-    // Hide slots that are already occupied for a common 60-minute booking.
-    return !hasApprovedConflict(room, datetime, 60);
+    return hasAnyAvailableEndSlot(room, datetime);
   });
   for (let i = 0; i < available.length; i += 3) {
     rows.push(
@@ -1185,24 +1217,30 @@ function timeInlineKeyboard(dateText, room) {
   return { inline_keyboard: rows };
 }
 
-function durationInlineKeyboard(room, datetime) {
-  const options = [30, 60, 90, 120, 180];
-  const available = options.filter((minutes) => {
-    if (!isWithinWorkingHoursWithDuration(datetime, minutes)) return false;
-    return !hasApprovedConflict(room, datetime, minutes);
-  });
-
+function endTimeInlineKeyboard(room, startDatetime) {
+  const datePart = startDatetime.split(" ")[0];
+  const startMs = parseDateTime(startDatetime).getTime();
   const rows = [];
-  for (let i = 0; i < available.length; i += 3) {
-    rows.push(
-      available.slice(i, i + 3).map((minutes) => ({
-        text: `${minutes} мин`,
-        callback_data: `book_duration:${minutes}`,
-      }))
-    );
-  }
-  if (rows.length === 0) {
-    rows.push([{ text: "Нет доступной длительности", callback_data: "noop" }]);
+  if (Number.isNaN(startMs)) {
+    rows.push([{ text: "Ошибка времени", callback_data: "noop" }]);
+  } else {
+    const closeMs = parseDateTime(`${datePart} ${String(WORK_END_HOUR).padStart(2, "0")}:00`).getTime();
+    const ends = [];
+    for (let endMs = startMs + 30 * 60000; endMs <= closeMs; endMs += 30 * 60000) {
+      const duration = Math.round((endMs - startMs) / 60000);
+      if (!isWithinWorkingHoursWithDuration(startDatetime, duration)) continue;
+      if (hasApprovedConflict(room, startDatetime, duration)) continue;
+      ends.push(toHHMM(new Date(endMs)));
+    }
+    for (let i = 0; i < ends.length; i += 3) {
+      rows.push(
+        ends.slice(i, i + 3).map((hm) => ({
+          text: `до ${hm}`,
+          callback_data: `book_end:${hm}`,
+        }))
+      );
+    }
+    if (rows.length === 0) rows.push([{ text: "Нет свободного окончания", callback_data: "noop" }]);
   }
   rows.push([
     { text: "⬅ Назад", callback_data: "book_back" },
