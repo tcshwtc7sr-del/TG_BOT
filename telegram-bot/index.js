@@ -15,6 +15,9 @@ const WORK_START_HOUR = toHour(process.env.WORK_START_HOUR, 9);
 const WORK_END_HOUR = toHour(process.env.WORK_END_HOUR, 18);
 const REMINDER_MINUTES_BEFORE = toPositiveInt(process.env.REMINDER_MINUTES_BEFORE, 30);
 const PENDING_TTL_HOURS = toPositiveInt(process.env.PENDING_TTL_HOURS, 24);
+/** Дата/время в брони — «настенные часы» организации (без суффикса Z). Должны совпадать с BOOKING_TIMEZONE. */
+const BOOKING_TIMEZONE = process.env.BOOKING_TIMEZONE || "Europe/Moscow";
+const BOOKING_LOCAL_OFFSET = process.env.BOOKING_LOCAL_OFFSET || "+03:00";
 
 // Локально: telegram-bot/data. На Amvera и др.: задайте DATA_DIR=/data (абсолютный путь к постоянному диску).
 const DATA_DIR = process.env.DATA_DIR
@@ -929,11 +932,32 @@ async function cleanupExpiredPending() {
   }
 }
 
+function orgWallHourMinute(utcMs) {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: BOOKING_TIMEZONE,
+    hour: "numeric",
+    minute: "numeric",
+    hourCycle: "h23",
+  }).formatToParts(new Date(utcMs));
+  const hour = Number(parts.find((p) => p.type === "hour")?.value);
+  const minute = Number(parts.find((p) => p.type === "minute")?.value);
+  return { hour, minute };
+}
+
+function orgEndHourCeil(utcMs) {
+  const { hour, minute } = orgWallHourMinute(utcMs);
+  if (Number.isNaN(hour)) return NaN;
+  return hour + (minute > 0 ? 1 : 0);
+}
+
 function isWithinWorkingHoursWithDuration(datetimeText, durationMinutes) {
   const start = parseDateTime(datetimeText);
-  const end = new Date(start.getTime() + durationMinutes * 60000);
-  const endHour = end.getHours() + (end.getMinutes() > 0 ? 1 : 0);
-  return start.getHours() >= WORK_START_HOUR && endHour <= WORK_END_HOUR;
+  const startMs = start.getTime();
+  if (Number.isNaN(startMs)) return false;
+  const end = new Date(startMs + durationMinutes * 60000);
+  const startHour = orgWallHourMinute(startMs).hour;
+  const endHour = orgEndHourCeil(end.getTime());
+  return startHour >= WORK_START_HOUR && endHour <= WORK_END_HOUR;
 }
 
 function isInPast(datetimeText) {
@@ -941,7 +965,12 @@ function isInPast(datetimeText) {
 }
 
 function parseDateTime(datetimeText) {
-  return new Date(`${datetimeText.replace(" ", "T")}:00`);
+  const raw = String(datetimeText || "").trim();
+  if (!raw) return new Date(NaN);
+  let iso = raw.replace(" ", "T");
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(iso)) iso = `${iso}:00`;
+  if (/[zZ]|[+-]\d{2}:\d{2}$/.test(iso)) return new Date(iso);
+  return new Date(`${iso}${BOOKING_LOCAL_OFFSET}`);
 }
 
 function formatDateTime(datetimeText) {
@@ -954,7 +983,15 @@ function formatRange(datetimeText, durationMinutes) {
 }
 
 function toHHMM(date) {
-  return `${`${date.getHours()}`.padStart(2, "0")}:${`${date.getMinutes()}`.padStart(2, "0")}`;
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: BOOKING_TIMEZONE,
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+  const hh = parts.find((p) => p.type === "hour")?.value ?? "00";
+  const mm = parts.find((p) => p.type === "minute")?.value ?? "00";
+  return `${hh.padStart(2, "0")}:${mm.padStart(2, "0")}`;
 }
 
 function statusLabel(status) {
