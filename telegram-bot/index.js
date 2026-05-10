@@ -500,7 +500,7 @@ bot.on("callback_query", async (query) => {
 
   if (data === "admin_history") {
     if (!isAdmin(userId)) return answer(query.id, "Только для админа.");
-    sendAdminHistory(chatId);
+    await sendAdminHistory(chatId);
     return answer(query.id);
   }
 
@@ -993,12 +993,25 @@ function parseDateTime(datetimeText) {
 }
 
 function formatDateTime(datetimeText) {
-  return datetimeText.replace(" ", " в ");
+  if (datetimeText == null || String(datetimeText).trim() === "") return "—";
+  return String(datetimeText).replace(" ", " в ");
 }
 
 function formatRange(datetimeText, durationMinutes) {
   const end = new Date(parseDateTime(datetimeText).getTime() + (durationMinutes || 60) * 60000);
   return `${formatDateTime(datetimeText)} - ${toHHMM(end)}`;
+}
+
+/** Для журнала админа: нет падения на старых/битых записях без datetime */
+function formatRangeSafe(datetimeText, durationMinutes) {
+  if (datetimeText == null || String(datetimeText).trim() === "") return "—";
+  const startMs = parseDateTime(String(datetimeText)).getTime();
+  if (Number.isNaN(startMs)) return "—";
+  try {
+    return formatRange(String(datetimeText), durationMinutes);
+  } catch {
+    return "—";
+  }
 }
 
 function toHHMM(date) {
@@ -1467,26 +1480,45 @@ function getActiveBookingForRoom(room, date) {
   return null;
 }
 
-function sendAdminHistory(chatId) {
+async function sendAdminHistory(chatId) {
   const data = readBookings();
   const logs = (data.actionLog || []).slice(0, 30);
   if (logs.length === 0) {
-    bot.sendMessage(chatId, "История действий пока пуста.", { reply_markup: adminNavKeyboard() });
+    await bot.sendMessage(chatId, "История действий пока пуста.", { reply_markup: adminNavKeyboard() });
     return;
   }
-  const text = logs
-    .map((entry, i) => {
-      const actionLabel =
-        entry.action === "approved" ? "подтвердил" : entry.action === "rejected" ? "отклонил" : "отменил";
-      return `${i + 1}) ${formatLogDate(entry.at)}
-Админ: ${entry.adminTag} (ID: ${entry.adminId})
+  const formatEntry = (entry, i) => {
+    const actionLabel =
+      entry.action === "approved" ? "подтвердил" : entry.action === "rejected" ? "отклонил" : "отменил";
+    return `${i + 1}) ${formatLogDate(entry.at)}
+Админ: ${entry.adminTag ?? "-"} (ID: ${entry.adminId ?? "-"})
 Действие: ${actionLabel} бронь #${entry.bookingId}
-Помещение: ${formatRoomForDisplay(entry.room)}
-Время: ${formatRange(entry.datetime, entry.durationMinutes)}
-Пользователь: ${entry.userTag} (ID: ${entry.userId})`;
-    })
-    .join("\n\n");
-  bot.sendMessage(chatId, `📜 История действий админов:\n\n${text}`, { reply_markup: adminNavKeyboard() });
+Помещение: ${formatRoomForDisplay(entry.room || "")}
+Время: ${formatRangeSafe(entry.datetime, entry.durationMinutes)}
+Пользователь: ${entry.userTag ?? "-"} (ID: ${entry.userId ?? "-"})`;
+  };
+  /** Несколько сообщений: лимит Telegram 4096 символов, 30 записей не помещаются в одно */
+  const perMessage = 8;
+  try {
+    for (let start = 0; start < logs.length; start += perMessage) {
+      const end = Math.min(start + perMessage, logs.length);
+      const slice = logs.slice(start, end);
+      const title =
+        start === 0
+          ? "📜 История действий админов:"
+          : `📜 История действий (записи ${start + 1}–${end}):`;
+      const body = slice.map((e, j) => formatEntry(e, start + j)).join("\n\n");
+      const isLast = end >= logs.length;
+      await bot.sendMessage(chatId, `${title}\n\n${body}`, isLast ? { reply_markup: adminNavKeyboard() } : {});
+    }
+  } catch (e) {
+    console.error("sendAdminHistory:", e?.message || e);
+    await bot
+      .sendMessage(chatId, "Не удалось показать историю. Полный журнал — в выгрузке «Таблица Excel (CSV)».", {
+        reply_markup: adminNavKeyboard(),
+      })
+      .catch(() => {});
+  }
 }
 
 function formatDate(date) {
