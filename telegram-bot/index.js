@@ -536,8 +536,9 @@ bot.on("callback_query", async (query) => {
         "⚠️ Экстренная очистка журнала действий админов",
         "",
         `1) Всем админам будут отправлены 3 CSV (все брони, журнал действий, архив завершённых броней).`,
-        "2) После бэкапа журнал действий админов будет полностью очищен (все записи).",
-        "Брони в базе не меняются.",
+        "2) После бэкапа журнал действий будет полностью очищен.",
+        "3) Из базы удалятся устаревшие брони: время слота уже прошло (любой статус: подтверждена, отклонена, ожидает) — всё в CSV.",
+        "Актуальные брони (время ещё не прошло) не трогаются.",
         "",
         "Подтвердите действие:",
       ].join("\n"),
@@ -567,9 +568,11 @@ bot.on("callback_query", async (query) => {
         });
         return answer(query.id);
       }
-      await bot.sendMessage(chatId, "Готово: три таблицы отправлены всем админам, журнал действий полностью очищен.", {
-        reply_markup: adminNavKeyboard(),
-      });
+      await bot.sendMessage(
+        chatId,
+        "Готово: три таблицы отправлены всем админам; журнал очищен полностью, устаревшие брони (слот уже прошёл) удалены из базы.",
+        { reply_markup: adminNavKeyboard() }
+      );
     } catch (e) {
       console.error("admin_emergency_purge_yes:", e?.message || e);
       await bot.sendMessage(chatId, "Ошибка при экстренной очистке. Проверьте логи сервера.", {
@@ -865,7 +868,8 @@ async function sendPurgeBackupCsvToAdmins(stamp, journalHint) {
     const cap1 = `Архив перед очисткой журнала — файл 1/3: все брони (${nBookings} строк). Сохраните.`;
     const cap2 = `Архив перед очисткой журнала — файл 2/3: история действий админов (${nLog} строк).`;
     const hint =
-      journalHint || `Из журнала затем удалятся записи старше ${ACTION_LOG_RETENTION_DAYS} сут.`;
+      journalHint ||
+      `Из журнала затем удалятся записи старше ${ACTION_LOG_RETENTION_DAYS} сут.; из базы — брони с уже прошедшим временем слота (уже в CSV).`;
     const cap3 = `Архив перед очисткой журнала — файл 3/3: завершённые брони (${nFin} строк). ${hint}`;
     for (const adminId of ADMIN_USER_IDS) {
       try {
@@ -901,7 +905,9 @@ async function runActionLogPurgeWithBackupToAdmins({ stamp, doneMessageTitle, mo
     const now = Date.now();
     await sendPurgeBackupCsvToAdmins(
       stamp,
-      mode === "full" ? "После этого весь журнал действий будет удалён." : undefined
+      mode === "full"
+        ? "После этого весь журнал будет удалён; из базы — брони с прошедшим временем слота (всё в CSV)."
+        : undefined
     );
 
     const dataAfter = readBookings();
@@ -919,6 +925,10 @@ async function runActionLogPurgeWithBackupToAdmins({ stamp, doneMessageTitle, mo
       removed = (dataAfter.actionLog || []).length - kept.length;
       dataAfter.actionLog = kept;
     }
+    const nBookingsBefore = (dataAfter.bookings || []).length;
+    dataAfter.bookings = (dataAfter.bookings || []).filter((b) => !isBookingFinished(b));
+    const removedStaleBookings = nBookingsBefore - dataAfter.bookings.length;
+
     const p = dataAfter.actionLogPurge;
     p.scheduledPurgeAt = new Date(now + ACTION_LOG_PURGE_INTERVAL_DAYS * 86400000).toISOString();
     p.notified24h = false;
@@ -930,7 +940,11 @@ async function runActionLogPurgeWithBackupToAdmins({ stamp, doneMessageTitle, mo
       mode === "full"
         ? `Удалены все записи журнала: ${removed}.`
         : `Удалено устаревших записей в журнале: ${removed}.`;
-    const doneMsg = `${doneMessageTitle} ${detail} Следующая плановая очистка (ориентир): ${formatLogDate(new Date(nextWhen).toISOString())}.`;
+    const bookingsPart =
+      removedStaleBookings > 0
+        ? ` Из базы убрано устаревших броней (время слота прошло): ${removedStaleBookings} (есть в присланном CSV).`
+        : "";
+    const doneMsg = `${doneMessageTitle} ${detail}${bookingsPart} Следующая плановая очистка (ориентир): ${formatLogDate(new Date(nextWhen).toISOString())}.`;
     for (const adminId of ADMIN_USER_IDS) {
       try {
         await bot.sendMessage(adminId, doneMsg);
@@ -989,7 +1003,7 @@ async function tickActionLogPurge() {
     if (msToPurge <= h2 && msToPurge > 0 && !p.notified2h) {
       p.notified2h = true;
       writeBookings(data);
-      const msg = `⏳ До плановой очистки журнала действий осталось около двух часов.\n\nИз журнала удалятся записи старше ${ACTION_LOG_RETENTION_DAYS} сут. Перед удалением бот пришлёт три CSV (как «Таблица Excel»): все брони, история действий и архив завершённых броней.\n\nМомент очистки (время организации): ${formatLogDate(new Date(when).toISOString())}`;
+      const msg = `⏳ До плановой очистки осталось около двух часов.\n\nБудут удалены: из журнала — записи старше ${ACTION_LOG_RETENTION_DAYS} сут.; из базы — брони с уже прошедшим временем слота. Перед этим придут три CSV.\n\nМомент (время организации): ${formatLogDate(new Date(when).toISOString())}`;
       for (const adminId of ADMIN_USER_IDS) {
         try {
           await bot.sendMessage(adminId, msg);
@@ -1003,7 +1017,7 @@ async function tickActionLogPurge() {
     if (msToPurge <= h24 && msToPurge > h2 && !p.notified24h) {
       p.notified24h = true;
       writeBookings(data);
-      const msg = `📅 Скоро плановая очистка журнала действий админов.\n\nЗаписи старше ${ACTION_LOG_RETENTION_DAYS} сут будут удалены из журнала. За ~2 часа — ещё напоминание; в момент очистки — три CSV (все брони, журнал, архив завершённых).\n\nМомент очистки (время организации): ${formatLogDate(new Date(when).toISOString())}`;
+      const msg = `📅 Скоро плановая очистка.\n\nИз журнала — записи старше ${ACTION_LOG_RETENTION_DAYS} сут.; из базы — брони с прошедшим временем слота. За ~2 часа — напоминание; перед очисткой — три CSV.\n\nМомент (время организации): ${formatLogDate(new Date(when).toISOString())}`;
       for (const adminId of ADMIN_USER_IDS) {
         try {
           await bot.sendMessage(adminId, msg);
@@ -1985,7 +1999,7 @@ function formatLogDate(iso) {
 
 function getHelpText(userId) {
   if (isAdmin(userId)) {
-    return `${HELP_TEXT_BASE}\n/admin — админ-панель (внутри: выгрузка броней в CSV)\n\nЖурнал действий админов: в интерфейсе только записи за последние ${ACTION_LOG_RETENTION_DAYS} сут.; раз в ${ACTION_LOG_PURGE_INTERVAL_DAYS} сут. — очистка журнала с напоминаниями и тремя CSV в личку (как кнопка «Таблица Excel»).`;
+    return `${HELP_TEXT_BASE}\n/admin — админ-панель (внутри: выгрузка броней в CSV)\n\nПлановая/экстренная очистка: после трёх CSV чистится журнал (по плану — старше ${ACTION_LOG_RETENTION_DAYS} сут.; экстренная — полностью) и из базы убираются брони с уже прошедшим временем слота. Интервал плановой: ${ACTION_LOG_PURGE_INTERVAL_DAYS} сут.`;
   }
   return HELP_TEXT_BASE;
 }
