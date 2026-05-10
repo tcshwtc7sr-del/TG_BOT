@@ -648,7 +648,7 @@ function buildBookingsCsv() {
     "Помещение (код в системе)",
     "Помещение",
     "Дата и время начала",
-    "Длительность, мин",
+    "Дата и время окончания",
     "ФИО заявителя",
     "Телефон",
     "Цель / мероприятие",
@@ -670,7 +670,7 @@ function buildBookingsCsv() {
         b.room || "",
         formatRoomForDisplay(b.room || ""),
         b.datetime || "",
-        b.durationMinutes ?? "",
+        formatBookingEndDatetimeForExport(b.datetime, b.durationMinutes),
         b.fullName || "",
         b.phone || "",
         b.purpose || "",
@@ -705,7 +705,7 @@ function buildActionLogCsv() {
     "Помещение (код в системе)",
     "Помещение",
     "Дата и время начала брони",
-    "Длительность, мин",
+    "Дата и время окончания брони",
     "Telegram ID заявителя",
     "Заявитель",
     "Telegram ID админа",
@@ -722,7 +722,7 @@ function buildActionLogCsv() {
         e.room || "",
         formatRoomForDisplay(e.room || ""),
         e.datetime || "",
-        e.durationMinutes ?? "",
+        formatBookingEndDatetimeForExport(e.datetime, e.durationMinutes),
         e.userId ?? "",
         e.userTag || "",
         e.adminId ?? "",
@@ -1011,6 +1011,22 @@ function toHHMM(date) {
   const hh = parts.find((p) => p.type === "hour")?.value ?? "00";
   const mm = parts.find((p) => p.type === "minute")?.value ?? "00";
   return `${hh.padStart(2, "0")}:${mm.padStart(2, "0")}`;
+}
+
+/** Для экспорта: окончание брони в часовом поясе организации (как в боте). */
+function formatBookingEndDatetimeForExport(datetimeText, durationMinutes) {
+  const startMs = parseDateTime(datetimeText).getTime();
+  if (Number.isNaN(startMs)) return "";
+  const dur = durationMinutes ?? 60;
+  const end = new Date(startMs + dur * 60000);
+  if (Number.isNaN(end.getTime())) return "";
+  const datePart = new Intl.DateTimeFormat("en-CA", {
+    timeZone: BOOKING_TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(end);
+  return `${datePart} ${toHHMM(end)}`;
 }
 
 function statusLabel(status) {
