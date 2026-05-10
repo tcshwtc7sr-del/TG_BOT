@@ -18,6 +18,10 @@ const PENDING_TTL_HOURS = toPositiveInt(process.env.PENDING_TTL_HOURS, 24);
 /** Дата/время в брони — «настенные часы» организации (без суффикса Z). Должны совпадать с BOOKING_TIMEZONE. */
 const BOOKING_TIMEZONE = process.env.BOOKING_TIMEZONE || "Europe/Moscow";
 const BOOKING_LOCAL_OFFSET = process.env.BOOKING_LOCAL_OFFSET || "+03:00";
+/** В «Истории действий» и при очистке: записи старше N суток считаются устаревшими */
+const ACTION_LOG_RETENTION_DAYS = Math.max(1, toPositiveInt(process.env.ACTION_LOG_RETENTION_DAYS, 30));
+/** Интервал плановой очистки: архив CSV всем админам → удаление записей старше ACTION_LOG_RETENTION_DAYS */
+const ACTION_LOG_PURGE_INTERVAL_DAYS = Math.max(1, toPositiveInt(process.env.ACTION_LOG_PURGE_INTERVAL_DAYS, 30));
 
 // Локально: telegram-bot/data. На Amvera и др.: задайте DATA_DIR=/data (абсолютный путь к постоянному диску).
 const DATA_DIR = process.env.DATA_DIR
@@ -52,6 +56,7 @@ const MONTHS_RU = [
   "Декабрь",
 ];
 const activeStates = new Map();
+let actionLogPurgeTickRunning = false;
 
 const WORK_HOURS_TEXT = `${String(WORK_START_HOUR).padStart(2, "0")}:00–${String(WORK_END_HOUR).padStart(2, "0")}:00`;
 
@@ -563,6 +568,7 @@ bot.on("polling_error", (error) => {
 setInterval(() => {
   sendUpcomingReminders().catch((error) => console.error("Reminder error:", error.message));
   cleanupExpiredPending().catch((error) => console.error("Pending cleanup error:", error.message));
+  tickActionLogPurge().catch((error) => console.error("Action log purge:", error.message));
 }, 30000);
 
 console.log("Telegram booking bot is running...");
@@ -586,10 +592,25 @@ function answer(callbackQueryId, text) {
   });
 }
 
+function defaultActionLogPurgeState() {
+  return {
+    scheduledPurgeAt: new Date(Date.now() + ACTION_LOG_PURGE_INTERVAL_DAYS * 86400000).toISOString(),
+    notified24h: false,
+    notified2h: false,
+  };
+}
+
 function ensureStorage() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(BOOKINGS_FILE)) {
-    fs.writeFileSync(BOOKINGS_FILE, JSON.stringify({ nextId: 1, bookings: [], actionLog: [] }, null, 2));
+    fs.writeFileSync(
+      BOOKINGS_FILE,
+      JSON.stringify(
+        { nextId: 1, bookings: [], actionLog: [], actionLogPurge: defaultActionLogPurgeState() },
+        null,
+        2
+      )
+    );
     return;
   }
   migrateStorageIfNeeded();
@@ -613,6 +634,24 @@ function migrateStorageIfNeeded() {
     }
     if (!booking.durationMinutes) {
       booking.durationMinutes = 60;
+      changed = true;
+    }
+  }
+  if (!data.actionLogPurge || typeof data.actionLogPurge !== "object") {
+    data.actionLogPurge = defaultActionLogPurgeState();
+    changed = true;
+  } else {
+    const p = data.actionLogPurge;
+    if (typeof p.scheduledPurgeAt !== "string" || !p.scheduledPurgeAt.trim()) {
+      p.scheduledPurgeAt = new Date(Date.now() + ACTION_LOG_PURGE_INTERVAL_DAYS * 86400000).toISOString();
+      changed = true;
+    }
+    if (typeof p.notified24h !== "boolean") {
+      p.notified24h = false;
+      changed = true;
+    }
+    if (typeof p.notified2h !== "boolean") {
+      p.notified2h = false;
       changed = true;
     }
   }
@@ -696,8 +735,7 @@ function actionLogActionRu(action) {
   return action || "";
 }
 
-function buildActionLogCsv() {
-  const data = readBookings();
+function buildActionLogCsvFromData(data) {
   const headers = [
     "Дата и время действия",
     "Действие",
@@ -735,6 +773,127 @@ function buildActionLogCsv() {
     );
   }
   return `\uFEFF${lines.join("\n")}`;
+}
+
+function buildActionLogCsv() {
+  return buildActionLogCsvFromData(readBookings());
+}
+
+/** Архив истории в CSV всем админам (перед очисткой) */
+async function sendActionLogArchiveToAdmins(filenameBase, caption) {
+  const data = readBookings();
+  const csv = buildActionLogCsvFromData(data);
+  const tmp = path.join(os.tmpdir(), `${filenameBase}.csv`);
+  fs.writeFileSync(tmp, csv, "utf8");
+  try {
+    if (ADMIN_USER_IDS.length === 0) {
+      console.warn("action log purge: ADMIN_USER_IDS пуст — архив истории некому отправить");
+      return;
+    }
+    for (const adminId of ADMIN_USER_IDS) {
+      try {
+        await bot.sendDocument(adminId, tmp, { caption });
+      } catch (e) {
+        console.error(`action log archive → admin ${adminId}:`, e?.message || e);
+      }
+    }
+  } finally {
+    fs.unlink(tmp, () => {});
+  }
+}
+
+function actionLogAtMs(entry) {
+  const t = new Date(entry?.at).getTime();
+  return Number.isNaN(t) ? null : t;
+}
+
+/** Плановая очистка журнала: напоминания за 24 ч и 2 ч, затем CSV и удаление записей старше retention */
+async function tickActionLogPurge() {
+  if (actionLogPurgeTickRunning) return;
+  actionLogPurgeTickRunning = true;
+  try {
+    const data = readBookings();
+    const p = data.actionLogPurge;
+    if (!p || typeof p !== "object") return;
+
+    const now = Date.now();
+    let when = new Date(p.scheduledPurgeAt).getTime();
+    if (Number.isNaN(when)) {
+      p.scheduledPurgeAt = new Date(now + ACTION_LOG_PURGE_INTERVAL_DAYS * 86400000).toISOString();
+      p.notified24h = false;
+      p.notified2h = false;
+      writeBookings(data);
+      return;
+    }
+
+    const retentionMs = ACTION_LOG_RETENTION_DAYS * 86400000;
+    const msToPurge = when - now;
+
+    if (now >= when) {
+      const stamp = formatExportFileTimestamp();
+      const nBefore = (data.actionLog || []).length;
+      await sendActionLogArchiveToAdmins(
+        `istoriya_admina_backup_pred_ochistkoy_${stamp}`,
+        `Архив истории действий перед плановой очисткой (${nBefore} записей). Сохраните файл. Удаляются записи старше ${ACTION_LOG_RETENTION_DAYS} сут.`
+      );
+
+      const cutoff = now - retentionMs;
+      const kept = (data.actionLog || []).filter((e) => {
+        const t = actionLogAtMs(e);
+        return t != null && t >= cutoff;
+      });
+      const removed = (data.actionLog || []).length - kept.length;
+      data.actionLog = kept;
+
+      p.scheduledPurgeAt = new Date(now + ACTION_LOG_PURGE_INTERVAL_DAYS * 86400000).toISOString();
+      p.notified24h = false;
+      p.notified2h = false;
+      writeBookings(data);
+
+      const nextWhen = new Date(p.scheduledPurgeAt).getTime();
+      const doneMsg = `Плановая очистка истории действий выполнена. Удалено устаревших записей: ${removed}. Следующая очистка (ориентир): ${formatLogDate(new Date(nextWhen).toISOString())}.`;
+      for (const adminId of ADMIN_USER_IDS) {
+        try {
+          await bot.sendMessage(adminId, doneMsg);
+        } catch (e) {
+          console.error(`purge done msg → ${adminId}:`, e?.message || e);
+        }
+      }
+      return;
+    }
+
+    const h2 = 2 * 3600000;
+    const h24 = 24 * 3600000;
+
+    if (msToPurge <= h2 && msToPurge > 0 && !p.notified2h) {
+      p.notified2h = true;
+      writeBookings(data);
+      const msg = `⏳ До плановой очистки истории действий осталось около двух часов.\n\nБудут удалены записи старше ${ACTION_LOG_RETENTION_DAYS} сут. Непосредственно перед удалением бот пришлёт CSV-архив всей истории каждому админу.\n\nМомент очистки (время организации): ${formatLogDate(new Date(when).toISOString())}`;
+      for (const adminId of ADMIN_USER_IDS) {
+        try {
+          await bot.sendMessage(adminId, msg);
+        } catch (e) {
+          console.error(`purge 2h → ${adminId}:`, e?.message || e);
+        }
+      }
+      return;
+    }
+
+    if (msToPurge <= h24 && msToPurge > h2 && !p.notified24h) {
+      p.notified24h = true;
+      writeBookings(data);
+      const msg = `📅 Завтра (или через сутки от этого момента) плановая очистка истории действий админов.\n\nЗаписи старше ${ACTION_LOG_RETENTION_DAYS} сут будут удалены из бота. За ~2 часа пришлём ещё одно напоминание; в момент очистки — CSV-архив.\n\nМомент очистки (время организации): ${formatLogDate(new Date(when).toISOString())}`;
+      for (const adminId of ADMIN_USER_IDS) {
+        try {
+          await bot.sendMessage(adminId, msg);
+        } catch (e) {
+          console.error(`purge 24h → ${adminId}:`, e?.message || e);
+        }
+      }
+    }
+  } finally {
+    actionLogPurgeTickRunning = false;
+  }
 }
 
 async function sendBookingsCsvExport(chatId) {
@@ -1484,10 +1643,20 @@ function getActiveBookingForRoom(room, date) {
 
 async function sendAdminHistory(chatId) {
   const data = readBookings();
-  /** В файле новые записи в начале массива; показываем 30 последних и сортируем: старые сверху, новые снизу */
-  const logs = (data.actionLog || []).slice(0, 30).reverse();
+  const retentionMs = ACTION_LOG_RETENTION_DAYS * 86400000;
+  const logCutoff = Date.now() - retentionMs;
+  /** Только записи не старше retention; в файле новые в начале — берём 30 последних среди «свежих», в чате: старые сверху */
+  const recent = (data.actionLog || []).filter((e) => {
+    const t = actionLogAtMs(e);
+    return t != null && t >= logCutoff;
+  });
+  const logs = recent.slice(0, 30).reverse();
   if (logs.length === 0) {
-    await bot.sendMessage(chatId, "История действий пока пуста.", { reply_markup: adminNavKeyboard() });
+    await bot.sendMessage(
+      chatId,
+      `За последние ${ACTION_LOG_RETENTION_DAYS} сут. в журнале нет записей. Более старые удаляются при плановой очистке (перед ней бот присылает CSV админам).`,
+      { reply_markup: adminNavKeyboard() }
+    );
     return;
   }
   const purposeLine = (p) => {
@@ -1654,7 +1823,7 @@ function formatLogDate(iso) {
 
 function getHelpText(userId) {
   if (isAdmin(userId)) {
-    return `${HELP_TEXT_BASE}\n/admin — админ-панель (внутри: выгрузка броней в CSV)`;
+    return `${HELP_TEXT_BASE}\n/admin — админ-панель (внутри: выгрузка броней в CSV)\n\nЖурнал действий админов: в интерфейсе только записи за последние ${ACTION_LOG_RETENTION_DAYS} сут.; раз в ${ACTION_LOG_PURGE_INTERVAL_DAYS} сут. — очистка с напоминаниями и CSV-архивом в личку.`;
   }
   return HELP_TEXT_BASE;
 }
