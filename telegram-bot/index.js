@@ -536,7 +536,7 @@ bot.on("callback_query", async (query) => {
         "⚠️ Экстренная очистка журнала действий админов",
         "",
         `1) Всем админам будут отправлены 3 CSV (все брони, журнал действий, архив завершённых броней).`,
-        `2) Из журнала удалятся записи старше ${ACTION_LOG_RETENTION_DAYS} сут.`,
+        "2) После бэкапа журнал действий админов будет полностью очищен (все записи).",
         "Брони в базе не меняются.",
         "",
         "Подтвердите действие:",
@@ -559,6 +559,7 @@ bot.on("callback_query", async (query) => {
       const r = await runActionLogPurgeWithBackupToAdmins({
         stamp: formatExportFileTimestamp(),
         doneMessageTitle: "Экстренная очистка журнала выполнена.",
+        mode: "full",
       });
       if (!r.ok) {
         await bot.sendMessage(chatId, "Сейчас уже выполняется очистка. Подождите ~1 мин и попробуйте снова.", {
@@ -566,7 +567,7 @@ bot.on("callback_query", async (query) => {
         });
         return answer(query.id);
       }
-      await bot.sendMessage(chatId, "Готово: три таблицы отправлены всем админам, журнал очищен от устаревших записей.", {
+      await bot.sendMessage(chatId, "Готово: три таблицы отправлены всем админам, журнал действий полностью очищен.", {
         reply_markup: adminNavKeyboard(),
       });
     } catch (e) {
@@ -840,8 +841,11 @@ function buildActionLogCsv() {
   return buildActionLogCsvFromData(readBookings());
 }
 
-/** Перед очисткой журнала: всем админам три CSV — как при кнопке «Таблица Excel» */
-async function sendPurgeBackupCsvToAdmins(stamp) {
+/**
+ * Перед очисткой журнала: всем админам три CSV — как при кнопке «Таблица Excel».
+ * @param {string} [journalHint] — что будет с журналом после (по умолчанию текст про retention).
+ */
+async function sendPurgeBackupCsvToAdmins(stamp, journalHint) {
   const data = readBookings();
   const nBookings = (data.bookings || []).length;
   const nLog = (data.actionLog || []).length;
@@ -860,7 +864,9 @@ async function sendPurgeBackupCsvToAdmins(stamp) {
     }
     const cap1 = `Архив перед очисткой журнала — файл 1/3: все брони (${nBookings} строк). Сохраните.`;
     const cap2 = `Архив перед очисткой журнала — файл 2/3: история действий админов (${nLog} строк).`;
-    const cap3 = `Архив перед очисткой журнала — файл 3/3: завершённые брони (${nFin} строк). Из журнала затем удалятся записи старше ${ACTION_LOG_RETENTION_DAYS} сут.`;
+    const hint =
+      journalHint || `Из журнала затем удалятся записи старше ${ACTION_LOG_RETENTION_DAYS} сут.`;
+    const cap3 = `Архив перед очисткой журнала — файл 3/3: завершённые брони (${nFin} строк). ${hint}`;
     for (const adminId of ADMIN_USER_IDS) {
       try {
         await bot.sendDocument(adminId, tmpB, { caption: cap1 });
@@ -878,10 +884,11 @@ async function sendPurgeBackupCsvToAdmins(stamp) {
 }
 
 /**
- * Три CSV всем админам, затем удаление из actionLog записей старше retention и перенос плановой даты.
+ * Три CSV всем админам, затем очистка журнала actionLog и перенос плановой даты.
+ * @param {"retention"|"full"} mode — retention: только старше ACTION_LOG_RETENTION_DAYS; full: весь журнал (экстренная очистка).
  * @returns {{ ok: true } | { ok: false, reason: "busy" }}
  */
-async function runActionLogPurgeWithBackupToAdmins({ stamp, doneMessageTitle }) {
+async function runActionLogPurgeWithBackupToAdmins({ stamp, doneMessageTitle, mode = "retention" }) {
   if (actionLogPurgeExecuteLock) return { ok: false, reason: "busy" };
   actionLogPurgeExecuteLock = true;
   try {
@@ -892,17 +899,26 @@ async function runActionLogPurgeWithBackupToAdmins({ stamp, doneMessageTitle }) 
       data = readBookings();
     }
     const now = Date.now();
-    await sendPurgeBackupCsvToAdmins(stamp);
+    await sendPurgeBackupCsvToAdmins(
+      stamp,
+      mode === "full" ? "После этого весь журнал действий будет удалён." : undefined
+    );
 
     const dataAfter = readBookings();
-    const retentionMs = ACTION_LOG_RETENTION_DAYS * 86400000;
-    const cutoff = now - retentionMs;
-    const kept = (dataAfter.actionLog || []).filter((e) => {
-      const t = actionLogAtMs(e);
-      return t != null && t >= cutoff;
-    });
-    const removed = (dataAfter.actionLog || []).length - kept.length;
-    dataAfter.actionLog = kept;
+    let removed;
+    if (mode === "full") {
+      removed = (dataAfter.actionLog || []).length;
+      dataAfter.actionLog = [];
+    } else {
+      const retentionMs = ACTION_LOG_RETENTION_DAYS * 86400000;
+      const cutoff = now - retentionMs;
+      const kept = (dataAfter.actionLog || []).filter((e) => {
+        const t = actionLogAtMs(e);
+        return t != null && t >= cutoff;
+      });
+      removed = (dataAfter.actionLog || []).length - kept.length;
+      dataAfter.actionLog = kept;
+    }
     const p = dataAfter.actionLogPurge;
     p.scheduledPurgeAt = new Date(now + ACTION_LOG_PURGE_INTERVAL_DAYS * 86400000).toISOString();
     p.notified24h = false;
@@ -910,7 +926,11 @@ async function runActionLogPurgeWithBackupToAdmins({ stamp, doneMessageTitle }) 
     writeBookings(dataAfter);
 
     const nextWhen = new Date(p.scheduledPurgeAt).getTime();
-    const doneMsg = `${doneMessageTitle} Удалено устаревших записей в журнале: ${removed}. Следующая плановая очистка (ориентир): ${formatLogDate(new Date(nextWhen).toISOString())}.`;
+    const detail =
+      mode === "full"
+        ? `Удалены все записи журнала: ${removed}.`
+        : `Удалено устаревших записей в журнале: ${removed}.`;
+    const doneMsg = `${doneMessageTitle} ${detail} Следующая плановая очистка (ориентир): ${formatLogDate(new Date(nextWhen).toISOString())}.`;
     for (const adminId of ADMIN_USER_IDS) {
       try {
         await bot.sendMessage(adminId, doneMsg);
@@ -955,6 +975,7 @@ async function tickActionLogPurge() {
       const r = await runActionLogPurgeWithBackupToAdmins({
         stamp,
         doneMessageTitle: "Плановая очистка истории действий выполнена.",
+        mode: "retention",
       });
       if (!r.ok) {
         console.warn("Плановая очистка: занято, повтор в следующем тике.");
