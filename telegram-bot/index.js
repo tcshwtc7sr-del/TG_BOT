@@ -520,6 +520,17 @@ bot.on("callback_query", async (query) => {
     return answer(query.id, "Готово");
   }
 
+  if (data === "admin_export_finished_csv") {
+    if (!isAdmin(userId)) return answer(query.id, "Только для админа.");
+    try {
+      await sendFinishedBookingsCsvExport(chatId);
+    } catch (e) {
+      console.error("admin_export_finished_csv:", e?.message || e);
+      bot.sendMessage(chatId, "Не удалось сформировать файл. Попробуйте позже.");
+    }
+    return answer(query.id, "Готово");
+  }
+
   if (data === "admin_delete_pick") {
     if (!isAdmin(userId)) return answer(query.id, "Только для админа.");
     sendAdminDeleteOptions(chatId);
@@ -679,8 +690,7 @@ function formatExportFileTimestamp() {
 }
 
 /** UTF-8 с BOM, разделитель «;» — в русском Excel обычно открывается в столбцы без лишних настроек */
-function buildBookingsCsv() {
-  const data = readBookings();
+function buildBookingsCsvFromList(bookings) {
   const headers = [
     "ID заявки",
     "Статус",
@@ -700,7 +710,7 @@ function buildBookingsCsv() {
     "Обработано админом",
   ];
   const lines = [headers.join(";")];
-  const sorted = [...(data.bookings || [])].sort((a, b) => (a.id < b.id ? 1 : -1));
+  const sorted = [...(bookings || [])].sort((a, b) => (a.id < b.id ? 1 : -1));
   for (const b of sorted) {
     lines.push(
       [
@@ -726,6 +736,10 @@ function buildBookingsCsv() {
     );
   }
   return `\uFEFF${lines.join("\n")}`;
+}
+
+function buildBookingsCsv() {
+  return buildBookingsCsvFromList(readBookings().bookings || []);
 }
 
 function actionLogActionRu(action) {
@@ -779,26 +793,33 @@ function buildActionLogCsv() {
   return buildActionLogCsvFromData(readBookings());
 }
 
-/** Архив истории в CSV всем админам (перед очисткой) */
-async function sendActionLogArchiveToAdmins(filenameBase, caption) {
+/** Перед очисткой журнала: всем админам два CSV — все брони и история действий */
+async function sendPurgeBackupCsvToAdmins(stamp) {
   const data = readBookings();
-  const csv = buildActionLogCsvFromData(data);
-  const tmp = path.join(os.tmpdir(), `${filenameBase}.csv`);
-  fs.writeFileSync(tmp, csv, "utf8");
+  const nBookings = (data.bookings || []).length;
+  const nLog = (data.actionLog || []).length;
+  const tmpB = path.join(os.tmpdir(), `broni_backup_pred_ochistkoy_${stamp}.csv`);
+  const tmpL = path.join(os.tmpdir(), `istoriya_admina_backup_pred_ochistkoy_${stamp}.csv`);
+  fs.writeFileSync(tmpB, buildBookingsCsvFromList(data.bookings || []), "utf8");
+  fs.writeFileSync(tmpL, buildActionLogCsvFromData(data), "utf8");
   try {
     if (ADMIN_USER_IDS.length === 0) {
-      console.warn("action log purge: ADMIN_USER_IDS пуст — архив истории некому отправить");
+      console.warn("purge backup: ADMIN_USER_IDS пуст — архив некому отправить");
       return;
     }
+    const cap1 = `Архив перед очисткой журнала — файл 1/2: все брони (${nBookings} строк). Сохраните.`;
+    const cap2 = `Архив перед очисткой журнала — файл 2/2: история действий админов (${nLog} строк). Из журнала затем удалятся записи старше ${ACTION_LOG_RETENTION_DAYS} сут.`;
     for (const adminId of ADMIN_USER_IDS) {
       try {
-        await bot.sendDocument(adminId, tmp, { caption });
+        await bot.sendDocument(adminId, tmpB, { caption: cap1 });
+        await bot.sendDocument(adminId, tmpL, { caption: cap2 });
       } catch (e) {
-        console.error(`action log archive → admin ${adminId}:`, e?.message || e);
+        console.error(`purge backup → admin ${adminId}:`, e?.message || e);
       }
     }
   } finally {
-    fs.unlink(tmp, () => {});
+    fs.unlink(tmpB, () => {});
+    fs.unlink(tmpL, () => {});
   }
 }
 
@@ -831,11 +852,7 @@ async function tickActionLogPurge() {
 
     if (now >= when) {
       const stamp = formatExportFileTimestamp();
-      const nBefore = (data.actionLog || []).length;
-      await sendActionLogArchiveToAdmins(
-        `istoriya_admina_backup_pred_ochistkoy_${stamp}`,
-        `Архив истории действий перед плановой очисткой (${nBefore} записей). Сохраните файл. Удаляются записи старше ${ACTION_LOG_RETENTION_DAYS} сут.`
-      );
+      await sendPurgeBackupCsvToAdmins(stamp);
 
       const cutoff = now - retentionMs;
       const kept = (data.actionLog || []).filter((e) => {
@@ -868,7 +885,7 @@ async function tickActionLogPurge() {
     if (msToPurge <= h2 && msToPurge > 0 && !p.notified2h) {
       p.notified2h = true;
       writeBookings(data);
-      const msg = `⏳ До плановой очистки истории действий осталось около двух часов.\n\nБудут удалены записи старше ${ACTION_LOG_RETENTION_DAYS} сут. Непосредственно перед удалением бот пришлёт CSV-архив всей истории каждому админу.\n\nМомент очистки (время организации): ${formatLogDate(new Date(when).toISOString())}`;
+      const msg = `⏳ До плановой очистки журнала действий осталось около двух часов.\n\nИз журнала удалятся записи старше ${ACTION_LOG_RETENTION_DAYS} сут. Перед удалением бот пришлёт два CSV каждому админу: все брони и полная история действий.\n\nМомент очистки (время организации): ${formatLogDate(new Date(when).toISOString())}`;
       for (const adminId of ADMIN_USER_IDS) {
         try {
           await bot.sendMessage(adminId, msg);
@@ -882,7 +899,7 @@ async function tickActionLogPurge() {
     if (msToPurge <= h24 && msToPurge > h2 && !p.notified24h) {
       p.notified24h = true;
       writeBookings(data);
-      const msg = `📅 Завтра (или через сутки от этого момента) плановая очистка истории действий админов.\n\nЗаписи старше ${ACTION_LOG_RETENTION_DAYS} сут будут удалены из бота. За ~2 часа пришлём ещё одно напоминание; в момент очистки — CSV-архив.\n\nМомент очистки (время организации): ${formatLogDate(new Date(when).toISOString())}`;
+      const msg = `📅 Скоро плановая очистка журнала действий админов.\n\nЗаписи старше ${ACTION_LOG_RETENTION_DAYS} сут будут удалены из журнала. За ~2 часа — ещё напоминание; в момент очистки — два CSV (все брони + история действий).\n\nМомент очистки (время организации): ${formatLogDate(new Date(when).toISOString())}`;
       for (const adminId of ADMIN_USER_IDS) {
         try {
           await bot.sendMessage(adminId, msg);
@@ -915,6 +932,29 @@ async function sendBookingsCsvExport(chatId) {
   } finally {
     fs.unlink(tmpBookings, () => {});
     fs.unlink(tmpLog, () => {});
+  }
+}
+
+/** CSV только подтверждённые брони, у которых уже прошло время окончания (как раздел «Архив» в чате) */
+async function sendFinishedBookingsCsvExport(chatId) {
+  const data = readBookings();
+  const finished = (data.bookings || []).filter((b) => b.status === "approved" && isBookingFinished(b));
+  if (finished.length === 0) {
+    await bot.sendMessage(chatId, "Нет завершённых подтверждённых броней для выгрузки.", {
+      reply_markup: adminNavKeyboard(),
+    });
+    return;
+  }
+  const stamp = formatExportFileTimestamp();
+  const tmp = path.join(os.tmpdir(), `arhiv_zavershennyh_bron_${stamp}.csv`);
+  fs.writeFileSync(tmp, buildBookingsCsvFromList(finished), "utf8");
+  try {
+    await bot.sendDocument(chatId, tmp, {
+      caption: `Архив завершённых броней (${finished.length} строк): статус «подтверждена», время мероприятия уже прошло. Тот же формат, что и в «Таблица Excel».`,
+      reply_markup: adminNavKeyboard(),
+    });
+  } finally {
+    fs.unlink(tmp, () => {});
   }
 }
 
@@ -1294,6 +1334,7 @@ function sendAdminMenu(chatId) {
         [{ text: "⏳ Заявки на согласование", callback_data: "admin_pending" }],
         [{ text: "🗓 Подтвержденное расписание", callback_data: "admin_schedule" }],
         [{ text: "🗂 Архив завершенных броней", callback_data: "admin_archive" }],
+        [{ text: "📥 CSV: завершённые брони", callback_data: "admin_export_finished_csv" }],
         [{ text: "🗑 Удалить бронь пользователя", callback_data: "admin_delete_pick" }],
         [{ text: "📜 История действий", callback_data: "admin_history" }],
         [{ text: "📥 Таблица Excel (CSV)", callback_data: "admin_export_csv" }],
@@ -1823,7 +1864,7 @@ function formatLogDate(iso) {
 
 function getHelpText(userId) {
   if (isAdmin(userId)) {
-    return `${HELP_TEXT_BASE}\n/admin — админ-панель (внутри: выгрузка броней в CSV)\n\nЖурнал действий админов: в интерфейсе только записи за последние ${ACTION_LOG_RETENTION_DAYS} сут.; раз в ${ACTION_LOG_PURGE_INTERVAL_DAYS} сут. — очистка с напоминаниями и CSV-архивом в личку.`;
+    return `${HELP_TEXT_BASE}\n/admin — админ-панель (внутри: выгрузка броней в CSV)\n\nЖурнал действий админов: в интерфейсе только записи за последние ${ACTION_LOG_RETENTION_DAYS} сут.; раз в ${ACTION_LOG_PURGE_INTERVAL_DAYS} сут. — очистка журнала с напоминаниями и двумя CSV в личку (все брони + журнал).`;
   }
   return HELP_TEXT_BASE;
 }
