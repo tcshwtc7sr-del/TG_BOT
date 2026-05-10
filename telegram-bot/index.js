@@ -57,6 +57,7 @@ const MONTHS_RU = [
 ];
 const activeStates = new Map();
 let actionLogPurgeTickRunning = false;
+let actionLogPurgeExecuteLock = false;
 
 const WORK_HOURS_TEXT = `${String(WORK_START_HOUR).padStart(2, "0")}:00–${String(WORK_END_HOUR).padStart(2, "0")}:00`;
 
@@ -520,6 +521,56 @@ bot.on("callback_query", async (query) => {
     return answer(query.id, "Готово");
   }
 
+  if (data === "admin_emergency_purge") {
+    if (!isAdmin(userId)) return answer(query.id, "Только для админа.");
+    bot.sendMessage(
+      chatId,
+      [
+        "⚠️ Экстренная очистка журнала действий админов",
+        "",
+        `1) Всем админам будут отправлены 3 CSV (все брони, журнал действий, архив завершённых броней).`,
+        `2) Из журнала удалятся записи старше ${ACTION_LOG_RETENTION_DAYS} сут.`,
+        "Брони в базе не меняются.",
+        "",
+        "Подтвердите действие:",
+      ].join("\n"),
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "✅ Да, с бэкапом и очисткой", callback_data: "admin_emergency_purge_yes" }],
+            [{ text: "⬅ В админ-панель", callback_data: "admin_menu" }],
+          ],
+        },
+      }
+    );
+    return answer(query.id);
+  }
+
+  if (data === "admin_emergency_purge_yes") {
+    if (!isAdmin(userId)) return answer(query.id, "Только для админа.");
+    try {
+      const r = await runActionLogPurgeWithBackupToAdmins({
+        stamp: formatExportFileTimestamp(),
+        doneMessageTitle: "Экстренная очистка журнала выполнена.",
+      });
+      if (!r.ok) {
+        await bot.sendMessage(chatId, "Сейчас уже выполняется очистка. Подождите ~1 мин и попробуйте снова.", {
+          reply_markup: adminNavKeyboard(),
+        });
+        return answer(query.id);
+      }
+      await bot.sendMessage(chatId, "Готово: три таблицы отправлены всем админам, журнал очищен от устаревших записей.", {
+        reply_markup: adminNavKeyboard(),
+      });
+    } catch (e) {
+      console.error("admin_emergency_purge_yes:", e?.message || e);
+      await bot.sendMessage(chatId, "Ошибка при экстренной очистке. Проверьте логи сервера.", {
+        reply_markup: adminNavKeyboard(),
+      });
+    }
+    return answer(query.id, "Выполнено");
+  }
+
   if (data === "admin_delete_pick") {
     if (!isAdmin(userId)) return answer(query.id, "Только для админа.");
     sendAdminDeleteOptions(chatId);
@@ -819,6 +870,53 @@ async function sendPurgeBackupCsvToAdmins(stamp) {
   }
 }
 
+/**
+ * Три CSV всем админам, затем удаление из actionLog записей старше retention и перенос плановой даты.
+ * @returns {{ ok: true } | { ok: false, reason: "busy" }}
+ */
+async function runActionLogPurgeWithBackupToAdmins({ stamp, doneMessageTitle }) {
+  if (actionLogPurgeExecuteLock) return { ok: false, reason: "busy" };
+  actionLogPurgeExecuteLock = true;
+  try {
+    let data = readBookings();
+    if (!data.actionLogPurge || typeof data.actionLogPurge !== "object") {
+      data.actionLogPurge = defaultActionLogPurgeState();
+      writeBookings(data);
+      data = readBookings();
+    }
+    const now = Date.now();
+    await sendPurgeBackupCsvToAdmins(stamp);
+
+    const dataAfter = readBookings();
+    const retentionMs = ACTION_LOG_RETENTION_DAYS * 86400000;
+    const cutoff = now - retentionMs;
+    const kept = (dataAfter.actionLog || []).filter((e) => {
+      const t = actionLogAtMs(e);
+      return t != null && t >= cutoff;
+    });
+    const removed = (dataAfter.actionLog || []).length - kept.length;
+    dataAfter.actionLog = kept;
+    const p = dataAfter.actionLogPurge;
+    p.scheduledPurgeAt = new Date(now + ACTION_LOG_PURGE_INTERVAL_DAYS * 86400000).toISOString();
+    p.notified24h = false;
+    p.notified2h = false;
+    writeBookings(dataAfter);
+
+    const nextWhen = new Date(p.scheduledPurgeAt).getTime();
+    const doneMsg = `${doneMessageTitle} Удалено устаревших записей в журнале: ${removed}. Следующая плановая очистка (ориентир): ${formatLogDate(new Date(nextWhen).toISOString())}.`;
+    for (const adminId of ADMIN_USER_IDS) {
+      try {
+        await bot.sendMessage(adminId, doneMsg);
+      } catch (e) {
+        console.error(`purge done msg → ${adminId}:`, e?.message || e);
+      }
+    }
+    return { ok: true };
+  } finally {
+    actionLogPurgeExecuteLock = false;
+  }
+}
+
 function actionLogAtMs(entry) {
   const t = new Date(entry?.at).getTime();
   return Number.isNaN(t) ? null : t;
@@ -843,34 +941,16 @@ async function tickActionLogPurge() {
       return;
     }
 
-    const retentionMs = ACTION_LOG_RETENTION_DAYS * 86400000;
     const msToPurge = when - now;
 
     if (now >= when) {
       const stamp = formatExportFileTimestamp();
-      await sendPurgeBackupCsvToAdmins(stamp);
-
-      const cutoff = now - retentionMs;
-      const kept = (data.actionLog || []).filter((e) => {
-        const t = actionLogAtMs(e);
-        return t != null && t >= cutoff;
+      const r = await runActionLogPurgeWithBackupToAdmins({
+        stamp,
+        doneMessageTitle: "Плановая очистка истории действий выполнена.",
       });
-      const removed = (data.actionLog || []).length - kept.length;
-      data.actionLog = kept;
-
-      p.scheduledPurgeAt = new Date(now + ACTION_LOG_PURGE_INTERVAL_DAYS * 86400000).toISOString();
-      p.notified24h = false;
-      p.notified2h = false;
-      writeBookings(data);
-
-      const nextWhen = new Date(p.scheduledPurgeAt).getTime();
-      const doneMsg = `Плановая очистка истории действий выполнена. Удалено устаревших записей: ${removed}. Следующая очистка (ориентир): ${formatLogDate(new Date(nextWhen).toISOString())}.`;
-      for (const adminId of ADMIN_USER_IDS) {
-        try {
-          await bot.sendMessage(adminId, doneMsg);
-        } catch (e) {
-          console.error(`purge done msg → ${adminId}:`, e?.message || e);
-        }
+      if (!r.ok) {
+        console.warn("Плановая очистка: занято, повтор в следующем тике.");
       }
       return;
     }
@@ -1318,6 +1398,7 @@ function sendAdminMenu(chatId) {
         [{ text: "🗑 Удалить бронь пользователя", callback_data: "admin_delete_pick" }],
         [{ text: "📜 История действий", callback_data: "admin_history" }],
         [{ text: "📥 Таблица Excel (CSV)", callback_data: "admin_export_csv" }],
+        [{ text: "🚨 Экстренная очистка журнала", callback_data: "admin_emergency_purge" }],
         [{ text: "🏠 В главное меню", callback_data: "menu" }],
       ],
     },
