@@ -704,6 +704,7 @@ function buildActionLogCsv() {
     "ID брони",
     "Помещение (код в системе)",
     "Помещение",
+    "Цель / мероприятие",
     "Дата и время начала брони",
     "Дата и время окончания брони",
     "Telegram ID заявителя",
@@ -721,6 +722,7 @@ function buildActionLogCsv() {
         e.bookingId ?? "",
         e.room || "",
         formatRoomForDisplay(e.room || ""),
+        e.purpose || "",
         e.datetime || "",
         formatBookingEndDatetimeForExport(e.datetime, e.durationMinutes),
         e.userId ?? "",
@@ -1482,11 +1484,18 @@ function getActiveBookingForRoom(room, date) {
 
 async function sendAdminHistory(chatId) {
   const data = readBookings();
-  const logs = (data.actionLog || []).slice(0, 30);
+  /** В файле новые записи в начале массива; показываем 30 последних и сортируем: старые сверху, новые снизу */
+  const logs = (data.actionLog || []).slice(0, 30).reverse();
   if (logs.length === 0) {
     await bot.sendMessage(chatId, "История действий пока пуста.", { reply_markup: adminNavKeyboard() });
     return;
   }
+  const purposeLine = (p) => {
+    const s = p == null ? "" : String(p).trim();
+    if (!s) return "—";
+    const max = 200;
+    return s.length <= max ? s : `${s.slice(0, max - 1)}…`;
+  };
   const formatEntry = (entry, i) => {
     const actionLabel =
       entry.action === "approved" ? "подтвердил" : entry.action === "rejected" ? "отклонил" : "отменил";
@@ -1494,6 +1503,7 @@ async function sendAdminHistory(chatId) {
 Админ: ${entry.adminTag ?? "-"} (ID: ${entry.adminId ?? "-"})
 Действие: ${actionLabel} бронь #${entry.bookingId}
 Помещение: ${formatRoomForDisplay(entry.room || "")}
+Мероприятие: ${purposeLine(entry.purpose)}
 Время: ${formatRangeSafe(entry.datetime, entry.durationMinutes)}
 Пользователь: ${entry.userTag ?? "-"} (ID: ${entry.userId ?? "-"})`;
   };
@@ -1617,6 +1627,7 @@ function addAdminActionLog(action, booking, adminUser) {
     action,
     bookingId: booking.id,
     room: booking.room,
+    purpose: booking.purpose || "",
     datetime: booking.datetime,
     durationMinutes: booking.durationMinutes || 60,
     userId: booking.userId,
