@@ -487,6 +487,12 @@ bot.on("callback_query", async (query) => {
     return answer(query.id);
   }
 
+  if (data === "admin_list_admins") {
+    if (!isAdmin(userId)) return answer(query.id, "Только для админа.");
+    await sendAdminList(chatId);
+    return answer(query.id);
+  }
+
   if (data === "admin_pending") {
     if (!isAdmin(userId)) return answer(query.id, "Только для админа.");
     sendAdminPending(chatId);
@@ -1399,11 +1405,43 @@ function sendAdminMenu(chatId) {
         [{ text: "🗑 Удалить бронь пользователя", callback_data: "admin_delete_pick" }],
         [{ text: "📜 История действий", callback_data: "admin_history" }],
         [{ text: "📥 Таблица Excel (CSV)", callback_data: "admin_export_csv" }],
+        [{ text: "👥 Список админов", callback_data: "admin_list_admins" }],
         [{ text: "🚨 Экстренная очистка журнала", callback_data: "admin_emergency_purge" }],
         [{ text: "🏠 В главное меню", callback_data: "menu" }],
       ],
     },
   });
+}
+
+async function sendAdminList(chatId) {
+  if (ADMIN_USER_IDS.length === 0) {
+    await bot.sendMessage(chatId, "Админов нет: в настройках бота пустой ADMIN_USER_IDS.", {
+      reply_markup: adminNavKeyboard(),
+    });
+    return;
+  }
+  const lines = [];
+  for (let i = 0; i < ADMIN_USER_IDS.length; i += 1) {
+    const id = ADMIN_USER_IDS[i];
+    try {
+      const ch = await bot.getChat(id);
+      const un = ch.username ? `@${String(ch.username).replace(/^@/, "")}` : null;
+      const name = [ch.first_name, ch.last_name].filter(Boolean).join(" ").trim() || null;
+      if (un) lines.push(`${i + 1}) ${un} · ID ${id}`);
+      else if (name) lines.push(`${i + 1}) ${name} · ID ${id} (username не указан в Telegram)`);
+      else lines.push(`${i + 1}) ID ${id} (имя недоступно)`);
+    } catch {
+      lines.push(`${i + 1}) ID ${id} — профиль недоступен (пользователь ещё не писал боту в личку)`);
+    }
+  }
+  const text = [
+    "👥 Администраторы по списку ADMIN_USER_IDS:",
+    "",
+    ...lines,
+    "",
+    "Подпись @username видна, если у человека он задан и бот уже «видел» этот чат (например, после /start).",
+  ].join("\n");
+  await bot.sendMessage(chatId, text, { reply_markup: adminNavKeyboard() });
 }
 
 function roomInlineKeyboard() {
