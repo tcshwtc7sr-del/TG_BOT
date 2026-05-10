@@ -779,8 +779,8 @@ function buildBookingsCsvFromList(bookings) {
         b.telegramUsername ?? "",
         b.userChatName ?? "",
         b.username ?? "",
-        b.createdAt ?? "",
-        b.reviewedAt ?? "",
+        b.createdAt ? formatLogDate(b.createdAt) : "",
+        b.reviewedAt ? formatLogDate(b.reviewedAt) : "",
       ]
         .map(csvCellSemicolon)
         .join(";")
@@ -820,7 +820,7 @@ function buildActionLogCsvFromData(data) {
   for (const e of logs) {
     lines.push(
       [
-        e.at || "",
+        e.at ? formatLogDate(e.at) : "",
         actionLogActionRu(e.action),
         e.bookingId ?? "",
         e.room || "",
